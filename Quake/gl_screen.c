@@ -1107,6 +1107,18 @@ static void SCR_DrawGUI (void *unused)
 {
 	cb_context_t *cbx = vulkan_globals.secondary_cb_contexts[SCBX_GUI];
 
+	/* TODO(vkquake-port): bring-up trace — confirm SCR_DrawGUI runs each frame and which
+	 * 2D path it takes (menu vs hud). Logged for the first few frames only. The menu path
+	 * (m_state != m_none) is the 2D-first validation target. Remove once 2D lands on HW. */
+	{
+		static int gui_calls = 0;
+		if (gui_calls < 8) {
+			Sys_Printf ("vkvid: SCR_DrawGUI #%d (con_forcedup=%d m_state=%d drawloading=%d)\n",
+			            gui_calls, (int)con_forcedup, (int)m_state, (int)scr_drawloading);
+			gui_calls++;
+		}
+	}
+
 	GL_SetCanvas (cbx, CANVAS_DEFAULT);
 	R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_blend_pipeline[cbx->render_pass_index]);
 
@@ -1201,6 +1213,27 @@ needs almost the entire 256k of stack space!
 */
 void SCR_UpdateScreen (qboolean use_tasks)
 {
+	/* TODO(vkquake-port): bring-up gate trace — log only on STATE CHANGE which early-return
+	 * (if any) is suppressing frames, so the orchestrator can tell "frames blocked by loading"
+	 * from "rendering". Edge-triggered to avoid flooding the lwip-shared UART. Remove once the
+	 * sustained 2D frame loop is proven on HW. */
+	{
+		static int last_gate = -2; /* -2 == uninitialized */
+		int		   gate;
+		if (!scr_initialized || !con_initialized || in_update_screen)
+			gate = 1; /* not initialized yet */
+		else if (Tasks_IsWorker ())
+			gate = 2; /* worker thread, not safe */
+		else if (scr_disabled_for_loading)
+			gate = 3; /* suppressed during load */
+		else
+			gate = 0; /* rendering */
+		if (gate != last_gate) {
+			Sys_Printf ("vkvid: SCR_UpdateScreen gate -> %d (0=render 1=init 2=worker 3=loading)\n", gate);
+			last_gate = gate;
+		}
+	}
+
 	if (!scr_initialized || !con_initialized || in_update_screen)
 		return; // not initialized yet
 
