@@ -3980,7 +3980,17 @@ void R_CreateShaderModules () /* was static: Phoenix no-WSI fb0 path builds the 
 	CREATE_SHADER_MODULE (alias_alphatest_frag);
 	CREATE_SHADER_MODULE (alias_oit_frag);
 	CREATE_SHADER_MODULE (alias_alphatest_oit_frag);
-	CREATE_SHADER_MODULE (md5_vert);
+	/* Phoenix no-WSI bring-up: md5_vert is the ONLY 2021-rerelease MD5-model shader module
+	 * (md5 reuses alias_frag for its fragment stage). It is unused by shareware id1 content and
+	 * the no-WSI shim only builds R_CreateBasicPipelines (UI variant), which never consumes
+	 * md5_vert_module — R_CreateMD5Pipelines (the only consumer) is not on the 2D path. On HW
+	 * vkCreateShaderModule(md5_vert) crashes with a NULL fptr (Exception #32 pc=0) after the 9
+	 * preceding modules succeed; skip it to discriminate (next-created module = sky_layer_vert:
+	 * if IT also crashes -> heap corruption from an earlier alloc; if it succeeds -> md5-specific).
+	 * Gate via CREATE_SHADER_MODULE_COND(false): md5_vert_module = VK_NULL_HANDLE; DESTROY guards on it.
+	 * TODO(vkquake-port): restore once rerelease/MD5 support is wired (and the NULL-fptr root-caused). */
+	Sys_Printf ("vkvid: shmod md5_vert SKIPPED (rerelease/MD5-only, unused by shareware)\n");
+	CREATE_SHADER_MODULE_COND (md5_vert, false);
 	CREATE_SHADER_MODULE (sky_layer_vert);
 	CREATE_SHADER_MODULE (sky_layer_frag);
 	CREATE_SHADER_MODULE (sky_box_frag);
