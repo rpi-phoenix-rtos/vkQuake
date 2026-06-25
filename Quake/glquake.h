@@ -719,6 +719,13 @@ void R_InitSamplers ();
 void R_CreatePipelineLayouts ();
 void R_CreatePipelines ();
 void R_DestroyPipelines ();
+/* Phoenix no-WSI fb0 path (pl_phoenix_vk_vid.c) builds only the UI-variant basic pipelines, so these
+ * four (formerly file-static in gl_rmisc.c) are exposed. R_CreateBasicPipelines skips MAIN/OIT/WBOIT
+ * variants whose render pass is VK_NULL_HANDLE. */
+void R_CreateShaderModules ();
+void R_DestroyShaderModules ();
+void R_InitVertexAttributes ();
+void R_CreateBasicPipelines ();
 
 #define MAX_PUSH_CONSTANT_SIZE 128 // Vulkan guaranteed minimum maxPushConstantsSize
 

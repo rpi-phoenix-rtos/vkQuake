@@ -2281,7 +2281,7 @@ static void R_SetWBOITBlend (VkPipelineColorBlendAttachmentState *blend_attachme
 R_InitVertexAttributes
 ===============
 */
-static void R_InitVertexAttributes ()
+void R_InitVertexAttributes () /* was static: see R_CreateShaderModules (Phoenix no-WSI UI pipelines) */
 {
 	{
 		basic_vertex_input_attribute_descriptions[0].binding = 0;
@@ -2484,7 +2484,7 @@ static void R_InitDefaultStates (pipeline_create_infos_t *infos)
 R_CreateBasicPipelines
 ===============
 */
-static void R_CreateBasicPipelines ()
+void R_CreateBasicPipelines () /* was static: Phoenix no-WSI fb0 path builds only the UI-variant basic pipelines (pl_phoenix_vk_vid.c) */
 {
 	VkResult				err;
 	pipeline_create_infos_t infos;
@@ -2511,6 +2511,8 @@ static void R_CreateBasicPipelines ()
 	for (int render_pass = 0; render_pass < countof (render_pass_variants); ++render_pass)
 	{
 		const int index = render_pass_variants[render_pass].index;
+		if (render_pass_variants[render_pass].render_pass == VK_NULL_HANDLE)
+			continue; /* Phoenix no-WSI: only RENDER_PASS_INDEX_UI has a render pass; MAIN/OIT/WBOIT are skipped */
 		infos.graphics_pipeline.renderPass = render_pass_variants[render_pass].render_pass;
 		infos.graphics_pipeline.subpass = render_pass_variants[render_pass].subpass;
 		infos.multisample_state.rasterizationSamples = render_pass_variants[render_pass].rasterization_samples;
@@ -2531,6 +2533,8 @@ static void R_CreateBasicPipelines ()
 	for (int render_pass = 0; render_pass < countof (render_pass_variants); ++render_pass)
 	{
 		const int index = render_pass_variants[render_pass].index;
+		if (render_pass_variants[render_pass].render_pass == VK_NULL_HANDLE)
+			continue; /* Phoenix no-WSI: see above */
 		infos.graphics_pipeline.renderPass = render_pass_variants[render_pass].render_pass;
 		infos.graphics_pipeline.subpass = render_pass_variants[render_pass].subpass;
 		infos.multisample_state.rasterizationSamples = render_pass_variants[render_pass].rasterization_samples;
@@ -2555,6 +2559,8 @@ static void R_CreateBasicPipelines ()
 	{
 		const int	   index = render_pass_variants[render_pass].index;
 		const qboolean wboit_pass = (index == RENDER_PASS_INDEX_WBOIT);
+		if (render_pass_variants[render_pass].render_pass == VK_NULL_HANDLE)
+			continue; /* Phoenix no-WSI: see above */
 		infos.graphics_pipeline.renderPass = render_pass_variants[render_pass].render_pass;
 		infos.graphics_pipeline.subpass = render_pass_variants[render_pass].subpass;
 		infos.multisample_state.rasterizationSamples = render_pass_variants[render_pass].rasterization_samples;
@@ -3953,7 +3959,7 @@ static void R_CreateIndirectComputePipelines ()
 R_CreateShaderModules
 ===============
 */
-static void R_CreateShaderModules ()
+void R_CreateShaderModules () /* was static: Phoenix no-WSI fb0 path builds the UI pipelines from the shim (pl_phoenix_vk_vid.c) */
 {
 	CREATE_SHADER_MODULE (basic_vert);
 	CREATE_SHADER_MODULE (basic_frag);
@@ -4005,7 +4011,7 @@ static void R_CreateShaderModules ()
 R_DestroyShaderModules
 ===============
 */
-static void R_DestroyShaderModules ()
+void R_DestroyShaderModules () /* was static: see R_CreateShaderModules (Phoenix no-WSI UI pipelines) */
 {
 	DESTROY_SHADER_MODULE (basic_vert);
 	DESTROY_SHADER_MODULE (basic_frag);
