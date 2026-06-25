@@ -27,6 +27,15 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include "gl_heap.h"
 #include <float.h>
 
+/* Phoenix no-WSI fb0 path (pl_phoenix_vk_vid.c): an mmap(MAP_ANONYMOUS)-backed
+ * VkAllocationCallbacks used as the pAllocator for shader-module create/destroy. Stock
+ * vkCreateShaderModule routes its (sizeof(module)+codeSize) allocation through libphoenix
+ * malloc when pAllocator==NULL, which faults for any single shader-module > one page (4096 B).
+ * Routing those allocations through mmap (a separate kernel mapping) bypasses the failing
+ * malloc heap. The driver does not record the create-time allocator, so DESTROY must pass the
+ * same callbacks (see DESTROY_SHADER_MODULE below). */
+extern const VkAllocationCallbacks *PL_VkHostAllocator (void);
+
 cvar_t r_lodbias = {"r_lodbias", "1", CVAR_ARCHIVE};
 cvar_t gl_lodbias = {"gl_lodbias", "0", CVAR_ARCHIVE};
 
@@ -2149,8 +2158,10 @@ static VkShaderModule R_CreateShaderModule (const byte *code, const int size, co
 	 * vkCreateShaderModule dies (Phoenix no-WSI bring-up, Instruction Abort pc=0). */
 	Sys_Printf ("vkvid: shmod %s size=%d code=%p dev=%p\n", name, (int)size, (const void *)code, (const void *)vulkan_globals.device);
 
+	/* Phoenix no-WSI fb0 path: pass an mmap-backed pAllocator so the >page (codeSize > 4096 B)
+	 * shader-module allocation bypasses the libphoenix malloc path that faults for such sizes. */
 	VkShaderModule module;
-	VkResult	   err = vkCreateShaderModule (vulkan_globals.device, &module_create_info, NULL, &module);
+	VkResult	   err = vkCreateShaderModule (vulkan_globals.device, &module_create_info, PL_VkHostAllocator (), &module);
 	if (err != VK_SUCCESS)
 		Sys_Error ("vkCreateShaderModule failed with code %i", (int)err);
 	Sys_Printf ("vkvid: shmod %s ok mod=%p\n", name, (const void *)module);
@@ -2197,12 +2208,15 @@ static VkVertexInputBindingDescription	 md5_vertex_binding_description;
 	{                                                                                                      \
 		name##_module = cond ? R_CreateShaderModule (name##_spv, name##_spv_size, #name) : VK_NULL_HANDLE; \
 	} while (0)
-#define DESTROY_SHADER_MODULE(name)                                             \
-	do                                                                          \
-	{                                                                           \
-		if (name##_module != VK_NULL_HANDLE)                                    \
-			vkDestroyShaderModule (vulkan_globals.device, name##_module, NULL); \
-		name##_module = VK_NULL_HANDLE;                                         \
+/* Phoenix no-WSI fb0 path: modules were created with PL_VkHostAllocator() as pAllocator; the
+ * driver does not remember the create-time allocator, so DESTROY must pass the SAME callbacks
+ * (passing NULL would free an mmap pointer via libphoenix free() -> crash). */
+#define DESTROY_SHADER_MODULE(name)                                                            \
+	do                                                                                         \
+	{                                                                                          \
+		if (name##_module != VK_NULL_HANDLE)                                                   \
+			vkDestroyShaderModule (vulkan_globals.device, name##_module, PL_VkHostAllocator ()); \
+		name##_module = VK_NULL_HANDLE;                                                        \
 	} while (0)
 
 DECLARE_SHADER_MODULE (basic_vert);
@@ -3980,17 +3994,11 @@ void R_CreateShaderModules () /* was static: Phoenix no-WSI fb0 path builds the 
 	CREATE_SHADER_MODULE (alias_alphatest_frag);
 	CREATE_SHADER_MODULE (alias_oit_frag);
 	CREATE_SHADER_MODULE (alias_alphatest_oit_frag);
-	/* Phoenix no-WSI bring-up: md5_vert is the ONLY 2021-rerelease MD5-model shader module
-	 * (md5 reuses alias_frag for its fragment stage). It is unused by shareware id1 content and
-	 * the no-WSI shim only builds R_CreateBasicPipelines (UI variant), which never consumes
-	 * md5_vert_module — R_CreateMD5Pipelines (the only consumer) is not on the 2D path. On HW
-	 * vkCreateShaderModule(md5_vert) crashes with a NULL fptr (Exception #32 pc=0) after the 9
-	 * preceding modules succeed; skip it to discriminate (next-created module = sky_layer_vert:
-	 * if IT also crashes -> heap corruption from an earlier alloc; if it succeeds -> md5-specific).
-	 * Gate via CREATE_SHADER_MODULE_COND(false): md5_vert_module = VK_NULL_HANDLE; DESTROY guards on it.
-	 * TODO(vkquake-port): restore once rerelease/MD5 support is wired (and the NULL-fptr root-caused). */
-	Sys_Printf ("vkvid: shmod md5_vert SKIPPED (rerelease/MD5-only, unused by shareware)\n");
-	CREATE_SHADER_MODULE_COND (md5_vert, false);
+	/* md5_vert (5228 B, > one page) previously crashed in vkCreateShaderModule under the default
+	 * libphoenix-malloc allocator and was gated off. With the mmap-backed PL_VkHostAllocator()
+	 * now passed as pAllocator (see R_CreateShaderModule), the >page allocation bypasses the
+	 * failing malloc path, so md5_vert is re-enabled — all shader modules are created again. */
+	CREATE_SHADER_MODULE (md5_vert);
 	CREATE_SHADER_MODULE (sky_layer_vert);
 	CREATE_SHADER_MODULE (sky_layer_frag);
 	CREATE_SHADER_MODULE (sky_box_frag);
