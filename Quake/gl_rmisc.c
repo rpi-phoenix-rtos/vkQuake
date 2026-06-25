@@ -2144,10 +2144,16 @@ static VkShaderModule R_CreateShaderModule (const byte *code, const int size, co
 	module_create_info.codeSize = size;
 	module_create_info.pCode = (const uint32_t *)code;
 
+	/* TODO(vkquake-port): drop this diag once R_CreateShaderModules is proven on HW.
+	 * Print BEFORE the call so the faulting shader's line is already on the UART when
+	 * vkCreateShaderModule dies (Phoenix no-WSI bring-up, Instruction Abort pc=0). */
+	Sys_Printf ("vkvid: shmod %s size=%d code=%p dev=%p\n", name, (int)size, (const void *)code, (const void *)vulkan_globals.device);
+
 	VkShaderModule module;
 	VkResult	   err = vkCreateShaderModule (vulkan_globals.device, &module_create_info, NULL, &module);
 	if (err != VK_SUCCESS)
 		Sys_Error ("vkCreateShaderModule failed with code %i", (int)err);
+	Sys_Printf ("vkvid: shmod %s ok mod=%p\n", name, (const void *)module);
 
 	GL_SetObjectName ((uint64_t)module, VK_OBJECT_TYPE_SHADER_MODULE, name);
 

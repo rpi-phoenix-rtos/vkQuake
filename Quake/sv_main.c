@@ -1381,6 +1381,16 @@ void SV_LocalSound (client_t *client, const char *sample)
 {
 	int sound_num, field_mask;
 
+	// Phoenix/V3D vkQuake bring-up: on real HW this server-side builtin was reached
+	// at startup with client == NULL (caller PF_sv_localsound resolves
+	// &svs.clients[entnum-1], which is NULL when svs.clients is not yet allocated),
+	// faulting at the &client->message deref (far=0x70). Writing a server datagram to
+	// a non-existent client is invalid regardless, so guard it. The deeper
+	// init-ordering question (why the server localsound path runs before a client
+	// exists) is left for the HW/debug build to reveal.
+	if (client == NULL)
+		return;
+
 	for (sound_num = 1; sound_num < MAX_SOUNDS && sv.sound_precache[sound_num]; sound_num++)
 	{
 		if (!strcmp (sample, sv.sound_precache[sound_num]))
