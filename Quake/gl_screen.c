@@ -1216,13 +1216,48 @@ static void SCR_DrawGUI (void *unused)
 			vulkan_globals.vk_cmd_bind_descriptor_sets (
 				cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_pipeline_layout.handle, 0, 1, &char_texture->descriptor_set, 0, NULL);
 			vulkan_globals.vk_cmd_draw (cbx->cb, 6, 1, 0, 0);
+
+			/* CONTROL TEXTURE: whitetexture (gl_texmgr.c) — a 2x2 SOLID-WHITE RGBA image created at
+			 * init through the SAME TexMgr_LoadImage -> R_StagingAllocate -> vkCmdCopyBufferToImage ->
+			 * SHADER_READ_ONLY path as conchars, but from a hardcoded all-255 byte array (NO palette /
+			 * d_8to24table conversion). Drawn @1100,50 via basic_blend, white-opaque, full UV. This is
+			 * the copy-mechanism-vs-conchars-data discriminator, zero masking (separate VkImage+descset):
+			 *   white SHOWS + conchars black -> the copy+sample+descriptor path WORKS; the bug is
+			 *        conchars-SPECIFIC -> its staged texels are zero (8-bit-paletted->RGBA conversion /
+			 *        palette.lmp produced all-zero, or its size/mip path). NOT the copy mechanism.
+			 *   white ALSO black -> the whole upload/sample path is broken for every texture (copy
+			 *        mechanism or descriptor-write/sampler) -> then the copy-vs-sample split matters. */
+			if (whitetexture && whitetexture->descriptor_set != VK_NULL_HANDLE) {
+				VkBuffer	   _bufw;
+				VkDeviceSize   _offw;
+				basicvertex_t *vw = (basicvertex_t *)R_VertexAllocate (6 * sizeof (basicvertex_t), &_bufw, &_offw);
+				const float wx = 1100.0f, wy = 50.0f, ww = 300.0f, wh = 300.0f;
+				basicvertex_t wc[4];
+				memset (wc, 0, sizeof (wc));
+				wc[0].position[0] = wx;		 wc[0].position[1] = wy;		wc[0].texcoord[0] = 0.0f; wc[0].texcoord[1] = 0.0f;
+				wc[1].position[0] = wx + ww; wc[1].position[1] = wy;		wc[1].texcoord[0] = 1.0f; wc[1].texcoord[1] = 0.0f;
+				wc[2].position[0] = wx + ww; wc[2].position[1] = wy + wh;	wc[2].texcoord[0] = 1.0f; wc[2].texcoord[1] = 1.0f;
+				wc[3].position[0] = wx;		 wc[3].position[1] = wy + wh;	wc[3].texcoord[0] = 0.0f; wc[3].texcoord[1] = 1.0f;
+				for (int i = 0; i < 4; ++i) {
+					wc[i].color[0] = 255; wc[i].color[1] = 255; wc[i].color[2] = 255; wc[i].color[3] = 255;
+				}
+				vw[0] = wc[0]; vw[1] = wc[1]; vw[2] = wc[2];
+				vw[3] = wc[2]; vw[4] = wc[3]; vw[5] = wc[0];
+				vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &_bufw, &_offw);
+				R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_blend_pipeline[cbx->render_pass_index]);
+				vulkan_globals.vk_cmd_bind_descriptor_sets (
+					cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_pipeline_layout.handle, 0, 1, &whitetexture->descriptor_set, 0, NULL);
+				vulkan_globals.vk_cmd_draw (cbx->cb, 6, 1, 0, 0);
+			}
 		}
 
 		{
+			extern gltexture_t *whitetexture;
 			static int probe_logged = 0;
 			if (probe_logged < 4) {
-				Sys_Printf ("vkvid: 2D BISECTOR notex-magenta@50,50 + textured-conchars@400,50 (blend, no alphatest); char_texture=%p descset=%p\n",
-				            (void *)char_texture, char_texture ? (void *)char_texture->descriptor_set : NULL);
+				Sys_Printf ("vkvid: 2D BISECTOR magenta@50 + conchars-blend@400 + conchars-alphatest@750 + WHITETEX-blend@1100; char_texture=%p descset=%p whitetexture=%p descset=%p\n",
+				            (void *)char_texture, char_texture ? (void *)char_texture->descriptor_set : NULL,
+				            (void *)whitetexture, whitetexture ? (void *)whitetexture->descriptor_set : NULL);
 				probe_logged++;
 			}
 		}
