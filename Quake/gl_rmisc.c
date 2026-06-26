@@ -2510,6 +2510,17 @@ void R_CreateBasicPipelines () /* was static: Phoenix no-WSI fb0 path builds onl
 	pipeline_create_infos_t infos;
 	R_InitDefaultStates (&infos);
 
+	/* Phoenix no-WSI fb0 path: disable back-face culling for the 2D/UI basic pipelines.
+	 * R_InitDefaultStates sets cullMode=BACK_BIT + frontFace=CLOCKWISE. The fb0 scanout present
+	 * uses a Y-flipped viewport (GL_Viewport: viewport.y = vid.height-(y+height)) on top of the
+	 * Y-negating 2D ortho (GL_OrthoMatrix), and on the V3D this net facing inversion makes the 2D
+	 * quads back-facing -> every 2D triangle is culled -> nothing rasterizes (HW: 2D draws recorded,
+	 * nullLayoutPC=0, but a textureless rect is invisible). 2D quads have no meaningful facing, so
+	 * CULL_MODE_NONE is the correct fix; it is scoped HERE to the basic 2D pipelines only (the
+	 * world/3D pipelines build their own infos and keep BACK-face culling). Same class as the
+	 * GLQuake-on-V3D back-face-cull fix. TODO(vkquake-port): if 3D later needs it, revisit frontFace. */
+	infos.rasterization_state.cullMode = VK_CULL_MODE_NONE;
+
 	const VkRenderPass main_render_pass = vulkan_globals.main_render_pass[MAIN_RENDER_PASS_STANDARD][MAIN_RENDER_PASS_STENCIL_CLEAR];
 	const VkRenderPass main_oit_render_pass = vulkan_globals.main_render_pass[MAIN_RENDER_PASS_OIT][MAIN_RENDER_PASS_STENCIL_CLEAR];
 	VkRenderPass	   ui_render_pass = vulkan_globals.secondary_cb_contexts[SCBX_GUI]->render_pass;
