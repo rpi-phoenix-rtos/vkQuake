@@ -1122,6 +1122,48 @@ static void SCR_DrawGUI (void *unused)
 	GL_SetCanvas (cbx, CANVAS_DEFAULT);
 	R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_blend_pipeline[cbx->render_pass_index]);
 
+	/* TODO(vkquake-port): bring-up BISECTOR for the "2D draws record but rasterize nothing" gap.
+	 * Draw a hardcoded-color rectangle (300x300 at 50,50) through the SAME 2D path as the console,
+	 * but with NO texture and NO palette dependency — basic_notex_blend pipeline, color hardcoded
+	 * (NOT from d_8to24table, whose palette.lmp could itself have failed to load, which would make a
+	 * normal Draw_Fill invisibly black and mislead the test). alpha=255 (notex_blend has blendEnable,
+	 * so a translucent color would vanish). Drawn via vulkan_globals.vk_cmd_draw so the draw-counter
+	 * counts it. Outcomes on the next grab:
+	 *   rect VISIBLE  -> raster/vertex/pipeline path WORKS; the gap is the glyph texture/descriptor
+	 *                    (sampler / descriptor-bind / alphatest), not geometry.
+	 *   rect INVISIBLE-> raster/vertex/pipeline itself is the gap (independent of textures).
+	 * Remove once 2D content lands. */
+	{
+		extern gltexture_t *char_texture; /* glyph atlas, owned by gl_draw.c (diagnostic only) */
+		VkBuffer	   _bufp;
+		VkDeviceSize   _offp;
+		basicvertex_t *vp = (basicvertex_t *)R_VertexAllocate (6 * sizeof (basicvertex_t), &_bufp, &_offp);
+		const float x = 50.0f, y = 50.0f, w = 300.0f, h = 300.0f;
+		const byte	r = 255, g = 0, b = 255, a = 255; /* opaque magenta, hardcoded (no palette) */
+		basicvertex_t cv[4];
+		memset (cv, 0, sizeof (cv));
+		cv[0].position[0] = x;	   cv[0].position[1] = y;
+		cv[1].position[0] = x + w; cv[1].position[1] = y;
+		cv[2].position[0] = x + w; cv[2].position[1] = y + h;
+		cv[3].position[0] = x;	   cv[3].position[1] = y + h;
+		for (int i = 0; i < 4; ++i) {
+			cv[i].color[0] = r; cv[i].color[1] = g; cv[i].color[2] = b; cv[i].color[3] = a;
+		}
+		vp[0] = cv[0]; vp[1] = cv[1]; vp[2] = cv[2];
+		vp[3] = cv[2]; vp[4] = cv[3]; vp[5] = cv[0];
+		vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &_bufp, &_offp);
+		R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_notex_blend_pipeline[cbx->render_pass_index]);
+		vulkan_globals.vk_cmd_draw (cbx->cb, 6, 1, 0, 0);
+		{
+			static int probe_logged = 0;
+			if (probe_logged < 4) {
+				Sys_Printf ("vkvid: 2D BISECTOR rect recorded (notex magenta 300x300); char_texture=%p descset=%p\n",
+				            (void *)char_texture, char_texture ? (void *)char_texture->descriptor_set : NULL);
+				probe_logged++;
+			}
+		}
+	}
+
 	// FIXME: only call this when needed
 	R_BeginDebugUtilsLabel (cbx, "2D");
 	SCR_TileClear (cbx);
