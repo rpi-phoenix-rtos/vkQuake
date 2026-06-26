@@ -1229,6 +1229,16 @@ static void TexMgr_LoadImage32 (gltexture_t *glt, unsigned *data)
 	image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 	vkCmdPipelineBarrier (command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_memory_barrier);
 
+#if defined(__phoenix__)
+	/* #29 black-texture triage: print exactly what vkQuake passes into vkCmdCopyBufferToImage,
+	 * so we can tell whether the degenerate 0x1 region extent V3DV sees originates HERE (region
+	 * built wrong) or downstream in the legacy->2 trampoline / struct marshalling. */
+	fprintf (stderr, "vkq-tex: upload '%s' glt=%dx%d num_regions=%d region0 extent=%dx%dx%d off=%d,%d,%d bufoff=%d\n",
+		glt->name, glt->width, glt->height, num_mips * (is_cube ? 6 : 1),
+		regions[0].imageExtent.width, regions[0].imageExtent.height, regions[0].imageExtent.depth,
+		regions[0].imageOffset.x, regions[0].imageOffset.y, regions[0].imageOffset.z,
+		(int)regions[0].bufferOffset);
+#endif
 	vkCmdCopyBufferToImage (command_buffer, staging_buffer, glt->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, num_mips * (is_cube ? 6 : 1), regions);
 
 	image_memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
