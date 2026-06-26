@@ -1154,10 +1154,74 @@ static void SCR_DrawGUI (void *unused)
 		vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &_bufp, &_offp);
 		R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_notex_blend_pipeline[cbx->render_pass_index]);
 		vulkan_globals.vk_cmd_draw (cbx->cb, 6, 1, 0, 0);
+
+		/* TODO(vkquake-port): TEXTURED bisector for the "textured 2D shows nothing" sub-gap.
+		 * Draw a 300x300 rect with the conchars glyph ATLAS sampled over its full 0..1 UV, via
+		 * basic_BLEND (alphatest DISABLED — the disambiguator: basic_alphatest would discard every
+		 * texel whose sampled alpha < 0.666, so an empty/zero texture would look identical to a
+		 * threshold bug). White opaque vertex color so the sampled texel passes through unmodulated.
+		 * char_texture->descriptor_set bound at set 0 (the exact Draw_Pic path). Outcomes:
+		 *   atlas VISIBLE (font glyphs shown) -> sampler+bind+UPLOAD all work; the console gap is the
+		 *                  ALPHATEST threshold path (alpha not reaching the shader as expected).
+		 *   atlas BLACK   -> texture samples 0 -> sampler / descriptor-bind / UPLOAD problem (image
+		 *                  allocated but not staged+transitioned to SHADER_READ_ONLY, or sampler wrong).
+		 * Only drawn if char_texture + descriptor_set are valid. Remove once console text lands. */
+		if (char_texture && char_texture->descriptor_set != VK_NULL_HANDLE) {
+			VkBuffer	   _buft;
+			VkDeviceSize   _offt;
+			basicvertex_t *vt = (basicvertex_t *)R_VertexAllocate (6 * sizeof (basicvertex_t), &_buft, &_offt);
+			const float tx = 400.0f, ty = 50.0f, tw = 300.0f, th = 300.0f;
+			basicvertex_t tc[4];
+			memset (tc, 0, sizeof (tc));
+			tc[0].position[0] = tx;		 tc[0].position[1] = ty;		tc[0].texcoord[0] = 0.0f; tc[0].texcoord[1] = 0.0f;
+			tc[1].position[0] = tx + tw; tc[1].position[1] = ty;		tc[1].texcoord[0] = 1.0f; tc[1].texcoord[1] = 0.0f;
+			tc[2].position[0] = tx + tw; tc[2].position[1] = ty + th;	tc[2].texcoord[0] = 1.0f; tc[2].texcoord[1] = 1.0f;
+			tc[3].position[0] = tx;		 tc[3].position[1] = ty + th;	tc[3].texcoord[0] = 0.0f; tc[3].texcoord[1] = 1.0f;
+			for (int i = 0; i < 4; ++i) {
+				tc[i].color[0] = 255; tc[i].color[1] = 255; tc[i].color[2] = 255; tc[i].color[3] = 255;
+			}
+			vt[0] = tc[0]; vt[1] = tc[1]; vt[2] = tc[2];
+			vt[3] = tc[2]; vt[4] = tc[3]; vt[5] = tc[0];
+			vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &_buft, &_offt);
+			R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_blend_pipeline[cbx->render_pass_index]);
+			vulkan_globals.vk_cmd_bind_descriptor_sets (
+				cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_pipeline_layout.handle, 0, 1, &char_texture->descriptor_set, 0, NULL);
+			vulkan_globals.vk_cmd_draw (cbx->cb, 6, 1, 0, 0);
+
+			/* SAME texture + geometry via basic_ALPHATEST (the real console-glyph pipeline), at
+			 * 750,50. Side-by-side with the blend rect this resolves three outcomes (NOT two):
+			 *   BOTH show     -> texture + both pipelines fine -> the real console/menu invisibility
+			 *                    is the ENGINE 2D DRAWING path (which textures / what canvas / whether
+			 *                    M_Draw actually emits geometry), NOT raster or alphatest. (The menu
+			 *                    was force-injected via Cbuf this session, so this is a live cause.)
+			 *   blend only    -> alphatest-specific (threshold discards real glyph alpha).
+			 *   both black    -> texture samples 0 -> upload / sampler / descriptor-bind. */
+			VkBuffer	   _bufa;
+			VkDeviceSize   _offa;
+			basicvertex_t *va = (basicvertex_t *)R_VertexAllocate (6 * sizeof (basicvertex_t), &_bufa, &_offa);
+			const float ax = 750.0f, ay = 50.0f, aw = 300.0f, ah = 300.0f;
+			basicvertex_t ac[4];
+			memset (ac, 0, sizeof (ac));
+			ac[0].position[0] = ax;		 ac[0].position[1] = ay;		ac[0].texcoord[0] = 0.0f; ac[0].texcoord[1] = 0.0f;
+			ac[1].position[0] = ax + aw; ac[1].position[1] = ay;		ac[1].texcoord[0] = 1.0f; ac[1].texcoord[1] = 0.0f;
+			ac[2].position[0] = ax + aw; ac[2].position[1] = ay + ah;	ac[2].texcoord[0] = 1.0f; ac[2].texcoord[1] = 1.0f;
+			ac[3].position[0] = ax;		 ac[3].position[1] = ay + ah;	ac[3].texcoord[0] = 0.0f; ac[3].texcoord[1] = 1.0f;
+			for (int i = 0; i < 4; ++i) {
+				ac[i].color[0] = 255; ac[i].color[1] = 255; ac[i].color[2] = 255; ac[i].color[3] = 255;
+			}
+			va[0] = ac[0]; va[1] = ac[1]; va[2] = ac[2];
+			va[3] = ac[2]; va[4] = ac[3]; va[5] = ac[0];
+			vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &_bufa, &_offa);
+			R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_alphatest_pipeline[cbx->render_pass_index]);
+			vulkan_globals.vk_cmd_bind_descriptor_sets (
+				cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_pipeline_layout.handle, 0, 1, &char_texture->descriptor_set, 0, NULL);
+			vulkan_globals.vk_cmd_draw (cbx->cb, 6, 1, 0, 0);
+		}
+
 		{
 			static int probe_logged = 0;
 			if (probe_logged < 4) {
-				Sys_Printf ("vkvid: 2D BISECTOR rect recorded (notex magenta 300x300); char_texture=%p descset=%p\n",
+				Sys_Printf ("vkvid: 2D BISECTOR notex-magenta@50,50 + textured-conchars@400,50 (blend, no alphatest); char_texture=%p descset=%p\n",
 				            (void *)char_texture, char_texture ? (void *)char_texture->descriptor_set : NULL);
 				probe_logged++;
 			}
