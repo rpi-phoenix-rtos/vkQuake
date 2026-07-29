@@ -141,6 +141,14 @@ static VkImageMemoryBarrier warp_image_barriers[MAX_GLTEXTURES];
 void R_UpdateWarpTextures (void *unused)
 {
 	cb_context_t *cbx = &vulkan_globals.primary_cb_contexts[PCBX_UPDATE_WARP];
+#if defined(__phoenix__)
+	/* TODO(vkquake-port): bring-up — the no-WSI Phoenix vid shim does not yet build the separate
+	 * warp VkRenderPass / warp pipelines that R_RasterWarpTexture needs, so skip animated-water
+	 * warp-texture rendering for now. Water surfaces sample their (un-warped) base warpimage; the
+	 * static world + sky render normally. Remove once the warp render pass/pipelines are wired. */
+	(void)cbx;
+	return;
+#endif
 	GL_SetCanvas (cbx, CANVAS_NONE); // Invalidate canvas so push constants get set later
 
 	texture_t *tx;
