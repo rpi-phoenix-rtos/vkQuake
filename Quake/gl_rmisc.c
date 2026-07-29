@@ -2443,10 +2443,12 @@ static void R_InitDefaultStates (pipeline_create_infos_t *infos)
 	infos->rasterization_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
 	infos->rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
 #if defined(__phoenix__)
-	/* BRING-UP (TODO vkquake-port): disable back-face culling so a winding/front-face mismatch on
-	 * V3DV can't hide the whole world (cf. project_quakespasm_port "gray-world = back-face cull").
-	 * Paired with the reversed-Z depth-clear fix; once the world is visible, bisect: restore
-	 * BACK_BIT and see whether the world survives (then the clear was the sole bug). */
+	/* BRING-UP (TODO vkquake-port): cull=NONE. Confirmed on HW: BACK+COUNTER_CLOCKWISE culled the
+	 * world walls (only the viewmodel survived), so the visible world faces are CLOCKWISE-wound;
+	 * BACK+CLOCKWISE is the eventual correct setting, but the viewmodel then winds the other way.
+	 * World brush surfaces are single polygons (drawn once), so NONE causes no z-fighting and shows
+	 * every surface. The remaining speckle is a texture-READ bug, independent of cull. Ship NONE
+	 * for bring-up; revisit per-pipeline winding once textures are clean. */
 	infos->rasterization_state.cullMode = VK_CULL_MODE_NONE;
 #else
 	infos->rasterization_state.cullMode = VK_CULL_MODE_BACK_BIT;
