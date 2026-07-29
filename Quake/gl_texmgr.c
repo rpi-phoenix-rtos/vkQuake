@@ -1218,6 +1218,7 @@ static void TexMgr_LoadImage32 (gltexture_t *glt, unsigned *data)
 	 * ZEROED_STRUCT_ARRAY default i.e. width never landed / was clobbered). Print right after the
 	 * build block; compare to the vkq-tex print just before vkCmdCopyBufferToImage to localise a
 	 * clobber in the intervening image_memory_barrier block. */
+	if (getenv ("VKQ_TEXDBG"))
 	fprintf (stderr, "vkq-tex-built: '%s' glt=%dx%d picmip-ignored mipwidth=%d mipheight=%d region0 extent=%dx%dx%d\n",
 		glt->name, glt->width, glt->height, mipwidth, mipheight,
 		regions[0].imageExtent.width, regions[0].imageExtent.height, regions[0].imageExtent.depth);
@@ -1244,6 +1245,7 @@ static void TexMgr_LoadImage32 (gltexture_t *glt, unsigned *data)
 	/* #29 black-texture triage: print exactly what vkQuake passes into vkCmdCopyBufferToImage,
 	 * so we can tell whether the degenerate 0x1 region extent V3DV sees originates HERE (region
 	 * built wrong) or downstream in the legacy->2 trampoline / struct marshalling. */
+	if (getenv ("VKQ_TEXDBG"))
 	fprintf (stderr, "vkq-tex: upload '%s' glt=%dx%d num_regions=%d region0 extent=%dx%dx%d off=%d,%d,%d bufoff=%d\n",
 		glt->name, glt->width, glt->height, num_mips * (is_cube ? 6 : 1),
 		regions[0].imageExtent.width, regions[0].imageExtent.height, regions[0].imageExtent.depth,
@@ -1274,6 +1276,7 @@ static void TexMgr_LoadImage32 (gltexture_t *glt, unsigned *data)
 			regions[ri].imageExtent.height = h ? h : 1u;
 			regions[ri].imageExtent.depth  = 1u;
 		}
+		if (getenv ("VKQ_TEXDBG"))
 		fprintf (stderr, "vkq-tex-fix: '%s' region0 extent now %dx%dx%d\n", glt->name,
 			regions[0].imageExtent.width, regions[0].imageExtent.height, regions[0].imageExtent.depth);
 	}
