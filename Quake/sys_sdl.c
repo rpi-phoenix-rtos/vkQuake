@@ -30,6 +30,7 @@ typedef struct file_handle_s
 {
 	FILE	   *file;
 	const byte *memory;
+	int			owns_memory; /* memory[] was malloc'd by a slurping Sys_FileOpenRead -> free() on close */
 	int			pos;
 	int			size;
 } file_handle_t;
@@ -65,24 +66,54 @@ qfileofs_t Sys_filelength (FILE *f)
 qfileofs_t Sys_FileOpenRead (const char *path, int *hndl)
 {
 	FILE *f;
-	int	  i, retval;
+	int	  i;
+	long  len;
+	byte *buf;
 
 	i = findhandle ();
 	f = fopen (path, "rb");
-
 	if (!f)
 	{
 		*hndl = -1;
-		retval = -1;
-	}
-	else
-	{
-		sys_handles[i].file = f;
-		*hndl = i;
-		retval = Sys_filelength (f);
+		return -1;
 	}
 
-	return retval;
+	/* Slurp the whole file into RAM and CLOSE it immediately, then serve reads/seeks
+	 * from the buffer (via the memory[] handle path below). Two reasons:
+	 *   1. pak0.pak over NFS is otherwise read per-lump (hundreds of slow random reads).
+	 *   2. CRITICAL for demo playback: upstream kept the pak FILE* open for the whole
+	 *      session, so CL_PlayDemo's second fopen() on the SAME pak was a concurrent
+	 *      stream — which libphoenix cannot read (fread returns 0), so demos silently
+	 *      CL_StopPlayback at signon 0. Closing here leaves the demo's fopen the sole
+	 *      OS stream on the file. (Mirrors the working quakespasm-port Sys_FileOpenRead.) */
+	fseek (f, 0, SEEK_END);
+	len = ftell (f);
+	fseek (f, 0, SEEK_SET);
+	if (len < 0)
+		len = 0;
+	buf = (byte *) malloc ((size_t) (len > 0 ? len : 1)); /* >=1 byte so memory[]!=NULL marks the handle used */
+	if (!buf)
+	{
+		fclose (f);
+		*hndl = -1;
+		return -1;
+	}
+	if (len > 0 && fread (buf, 1, (size_t) len, f) != (size_t) len)
+	{
+		free (buf);
+		fclose (f);
+		*hndl = -1;
+		return -1;
+	}
+	fclose (f);
+
+	sys_handles[i].file = NULL;
+	sys_handles[i].memory = buf;
+	sys_handles[i].owns_memory = 1;
+	sys_handles[i].size = (int) len;
+	sys_handles[i].pos = 0;
+	*hndl = i;
+	return (qfileofs_t) len;
 }
 
 void Sys_MemFileOpenRead (const byte *memory, int size, int *hndl)
@@ -117,8 +148,14 @@ void Sys_FileClose (int handle)
 		fclose (sys_handles[handle].file);
 		sys_handles[handle].file = NULL;
 	}
-	else
-		sys_handles[handle].memory = NULL;
+	else if (sys_handles[handle].owns_memory && sys_handles[handle].memory)
+	{
+		free ((void *) sys_handles[handle].memory); /* slurped read buffer (NOT the static embedded pak) */
+	}
+	sys_handles[handle].memory = NULL;
+	sys_handles[handle].owns_memory = 0;
+	sys_handles[handle].size = 0;
+	sys_handles[handle].pos = 0;
 }
 
 void Sys_FileSeek (int handle, int position)
@@ -135,6 +172,11 @@ int Sys_FileRead (int handle, void *dest, int count)
 		return fread (dest, 1, count, sys_handles[handle].file);
 	else
 	{
+		int avail = sys_handles[handle].size - sys_handles[handle].pos;
+		if (count > avail)
+			count = avail;
+		if (count <= 0)
+			return 0;
 		memcpy (dest, sys_handles[handle].memory + sys_handles[handle].pos, count);
 		sys_handles[handle].pos += count;
 		return count;

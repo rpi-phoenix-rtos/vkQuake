@@ -2637,6 +2637,19 @@ static void Host_Startdemos_f (void)
 	if (!sv.active && cls.demonum != -1 && !cls.demoplayback)
 	{
 		cls.demonum = 0;
+		/* Phoenix vkQuake bring-up: SKIP the auto-demo world-load. quake.rc's `startdemos`
+		 * runs inside Host_Init's Cbuf_Execute (host.c), so CL_NextDemo->demo1 would load a BSP
+		 * world + drive V_RenderView DURING Host_Init — before the instrumented frame loop, so a
+		 * world-render hang there is invisible/undebuggable. Go straight to the menu so Host_Init
+		 * completes cleanly; the world is then loaded by pl_phoenix_main's post-Host_Init
+		 * `map start`, inside the frame loop where the loop-N enter/exit heartbeat can pinpoint it.
+		 * TODO(vkquake-port): restore the demo loop once the world render path is proven. */
+		if (1)
+		{
+			cls.demonum = -1;
+			Cbuf_InsertText ("menu_main\n");
+			return;
+		}
 		if (!fitzmode && !cl_startdemos.value)
 		{ /* QuakeSpasm customization: */
 			/* go straight to menu, no CL_NextDemo */
