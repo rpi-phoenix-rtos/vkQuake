@@ -2442,17 +2442,11 @@ static void R_InitDefaultStates (pipeline_create_infos_t *infos)
 
 	infos->rasterization_state.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
 	infos->rasterization_state.polygonMode = VK_POLYGON_MODE_FILL;
-#if defined(__phoenix__)
-	/* BRING-UP (TODO vkquake-port): cull=NONE. Confirmed on HW: BACK+COUNTER_CLOCKWISE culled the
-	 * world walls (only the viewmodel survived), so the visible world faces are CLOCKWISE-wound;
-	 * BACK+CLOCKWISE is the eventual correct setting, but the viewmodel then winds the other way.
-	 * World brush surfaces are single polygons (drawn once), so NONE causes no z-fighting and shows
-	 * every surface. The remaining speckle is a texture-READ bug, independent of cull. Ship NONE
-	 * for bring-up; revisit per-pipeline winding once textures are clean. */
-	infos->rasterization_state.cullMode = VK_CULL_MODE_NONE;
-#else
+	/* Back-face culling ON (upstream default). The earlier Phoenix bring-up forced cull=NONE while
+	 * textures/winding were being debugged; with textures clean and the per-pipeline frontFace values
+	 * (world=CLOCKWISE default, alias/viewmodel=COUNTER_CLOCKWISE) correct, BACK culling is the right
+	 * setting — skips back faces (perf) and matches upstream. */
 	infos->rasterization_state.cullMode = VK_CULL_MODE_BACK_BIT;
-#endif
 	infos->rasterization_state.frontFace = VK_FRONT_FACE_CLOCKWISE;
 	infos->rasterization_state.depthClampEnable = VK_FALSE;
 	infos->rasterization_state.rasterizerDiscardEnable = VK_FALSE;
