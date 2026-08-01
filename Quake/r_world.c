@@ -1304,17 +1304,6 @@ void R_DrawTextureChains_Water (cb_context_t *cbx, qmodel_t *model, entity_t *en
 			int lastlightmap = -2;
 
 			gltexture_t *gl_texture = t->warpimage;
-#if defined(__phoenix__)
-			/* Phoenix/V3DV: the per-frame warp COMPUTE (cs_tex_warp) is dispatched and the texture
-			 * is added to the warp list, but its output never lands in the sampled warpimage — a V3D
-			 * compute-write -> texture-sample coherency gap — so every liquid surface samples a BLACK
-			 * warpimage (reported as "black lava/water"). The BASE liquid texture is correct, so sample
-			 * it directly: liquids render with correct colours, only WITHOUT the animated warp wiggle.
-			 * TODO(vkquake-port): fix the V3D compute-image path (also unblocks GPU-compute lightmaps,
-			 * #44) and restore t->warpimage here. */
-			if (t->gltexture)
-				gl_texture = t->gltexture;
-#endif
 			if (!r_lightmap_cheatsafe)
 				vulkan_globals.vk_cmd_bind_descriptor_sets (
 					cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.world_pipeline_layout.handle, 0, 1, &gl_texture->descriptor_set, 0, NULL);
