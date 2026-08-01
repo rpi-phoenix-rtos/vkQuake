@@ -1319,19 +1319,7 @@ void R_DrawTextureChains_Water (cb_context_t *cbx, qmodel_t *model, entity_t *en
 					if (alpha_blend)
 						R_PushConstants (cbx, VK_SHADER_STAGE_ALL_GRAPHICS, 20 * sizeof (float), 1 * sizeof (float), &alpha);
 					R_FlushBatch (cbx, false, false, alpha_blend, false, lightmap_texture, &brushpasses);
-#if defined(__phoenix__)
-					/* Draw liquids (water/lava/slime/teleport) FULLBRIGHT via the uniform bright
-					 * fallback lightmap, matching classic Quake. The Phoenix CPU lightmap path
-					 * (r_gpulightmapupdate=0, TODO #44) does not build lightmaps for liquid
-					 * surfaces, so a real per-surface lightmap here is dark/unbuilt and modulates
-					 * the (correct) warp texture to BLACK — e.g. start.bsp's HARD-skill lava pool,
-					 * while the same *lava1 texture on a lit surface renders orange. Forcing
-					 * greylightmap gives uniform full brightness. Remove once #44 builds liquid
-					 * lightmaps and lit water is wanted. */
-					lightmap_texture = greylightmap;
-#else
 					lightmap_texture = (s->lightmaptexturenum >= 0) ? lightmaps[s->lightmaptexturenum].texture : greylightmap;
-#endif
 					lastlightmap = s->lightmaptexturenum;
 				}
 				R_BatchSurface (cbx, s, false, false, alpha_blend, false, lightmap_texture, &brushpasses);

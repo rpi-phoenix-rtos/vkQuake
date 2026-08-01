@@ -1212,18 +1212,6 @@ static void TexMgr_LoadImage32 (gltexture_t *glt, unsigned *data)
 		regions[0].imageExtent.depth = 1;
 	}
 
-#if defined(__phoenix__)
-	/* #29 bracket print: the region extent observed at the copy call was 0x1x1 regardless of
-	 * texture size (size-independent -> the value is NOT derived from mipwidth here, it is the
-	 * ZEROED_STRUCT_ARRAY default i.e. width never landed / was clobbered). Print right after the
-	 * build block; compare to the vkq-tex print just before vkCmdCopyBufferToImage to localise a
-	 * clobber in the intervening image_memory_barrier block. */
-	if (getenv ("VKQ_TEXDBG"))
-	fprintf (stderr, "vkq-tex-built: '%s' glt=%dx%d picmip-ignored mipwidth=%d mipheight=%d region0 extent=%dx%dx%d\n",
-		glt->name, glt->width, glt->height, mipwidth, mipheight,
-		regions[0].imageExtent.width, regions[0].imageExtent.height, regions[0].imageExtent.depth);
-#endif
-
 	ZEROED_STRUCT (VkImageMemoryBarrier, image_memory_barrier);
 	image_memory_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
 	image_memory_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -1241,17 +1229,6 @@ static void TexMgr_LoadImage32 (gltexture_t *glt, unsigned *data)
 	image_memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
 	vkCmdPipelineBarrier (command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image_memory_barrier);
 
-#if defined(__phoenix__)
-	/* #29 black-texture triage: print exactly what vkQuake passes into vkCmdCopyBufferToImage,
-	 * so we can tell whether the degenerate 0x1 region extent V3DV sees originates HERE (region
-	 * built wrong) or downstream in the legacy->2 trampoline / struct marshalling. */
-	if (getenv ("VKQ_TEXDBG"))
-	fprintf (stderr, "vkq-tex: upload '%s' glt=%dx%d num_regions=%d region0 extent=%dx%dx%d off=%d,%d,%d bufoff=%d\n",
-		glt->name, glt->width, glt->height, num_mips * (is_cube ? 6 : 1),
-		regions[0].imageExtent.width, regions[0].imageExtent.height, regions[0].imageExtent.depth,
-		regions[0].imageOffset.x, regions[0].imageOffset.y, regions[0].imageOffset.z,
-		(int)regions[0].bufferOffset);
-#endif
 #if defined(__phoenix__)
 	/* #29 FIX: on the Phoenix/aarch64 build the region imageExtent reaches the driver as 0x1x1
 	 * regardless of texture size (width never lands as built — observed for every texture, 2x2
