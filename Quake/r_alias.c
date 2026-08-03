@@ -198,6 +198,13 @@ static void GL_DrawAliasFrame (
 		if (paliashdr->poseverttype == PV_QUAKE3)
 			ubo->flags |= 0x4;
 
+#if defined(__phoenix__)
+		/* Opaque draw -> present with alpha=1 (the no-WSI fb0 scanout uses color-buffer alpha;
+		 * see alias_common.inc). Opaque = not alpha-blended and not alpha-tested. */
+		if (!has_alpha && !alphatest && showtris == 0)
+			ubo->flags |= 0x10;
+#endif
+
 		ubo->entalpha = entity_alpha;
 
 		VkDescriptorSet descriptor_sets[3] = {tx->descriptor_set, (fb != NULL) ? fb->descriptor_set : tx->descriptor_set, ubo_set};
