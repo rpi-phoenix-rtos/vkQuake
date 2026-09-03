@@ -212,8 +212,31 @@ static void GL_DrawAliasFrame (
 			cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout.handle, 0, 3, descriptor_sets, 1, &uniform_offset);
 
 		VkBuffer	 vertex_buffers[3] = {paliashdr->vertex_buffer, paliashdr->vertex_buffer, paliashdr->vertex_buffer};
+
+		/* #67 SINGLE-POSE FIX (Phoenix/V3D). When pose1 == pose2 the blend above is
+		 * forced to 0, and both position bindings then resolve to the SAME buffer
+		 * offset. V3D mishandles that draw: nothing is rasterised at all. It is the
+		 * same hardware defect quakespasm hit (fork 4ef0a42), where the cure was to
+		 * leave the Pose2 vertex ATTRIBUTE unbound -- not an option in Vulkan, where
+		 * attributes are fixed by the pipeline's vertex-input state, so the binding
+		 * has to point somewhere valid.
+		 *
+		 * Point it at a DIFFERENT pose instead. At blend == 0 the shader computes
+		 * mix(Pose1, Pose2, 0.0) == Pose1, so whichever pose slot 2 names contributes
+		 * exactly nothing to the result -- only the offsets differ, which is what the
+		 * hardware needs. Measured on HW: with the offsets equal the start-map torch
+		 * flames score 0 lit pixels in both ROIs across 7 frames; forcing a real
+		 * two-pose lerp (r_lerpmodels 2, i.e. distinct offsets) scores 397-599.
+		 *
+		 * numposes <= 1 cannot produce a distinct offset, so those models are left
+		 * as they were. Nothing in the start map exercises that case -- the flames
+		 * are multi-pose -- so it stays UNVERIFIED rather than silently "fixed". */
+		int pose2bind = lerpdata.pose2;
+		if (blend == 0 && paliashdr->numposes > 1)
+			pose2bind = (lerpdata.pose1 + 1) % paliashdr->numposes;
+
 		VkDeviceSize vertex_offsets[3] = {
-			(unsigned)paliashdr->vbostofs, GLARB_GetXYZOffset (e, paliashdr, lerpdata.pose1), GLARB_GetXYZOffset (e, paliashdr, lerpdata.pose2)};
+			(unsigned)paliashdr->vbostofs, GLARB_GetXYZOffset (e, paliashdr, lerpdata.pose1), GLARB_GetXYZOffset (e, paliashdr, pose2bind)};
 		vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 3, vertex_buffers, vertex_offsets);
 		vulkan_globals.vk_cmd_bind_index_buffer (cbx->cb, paliashdr->index_buffer, 0, VK_INDEX_TYPE_UINT16);
 
