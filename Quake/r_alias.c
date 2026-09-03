@@ -176,46 +176,6 @@ static void GL_DrawAliasFrame (
 	else // poses the same means either 1. the entity has paused its animation, or 2. r_lerpmodels is disabled
 		blend = 0;
 
-#if defined(__phoenix__)
-	/* #67 diagnostic. The start-map torch flames render on V3D only when
-	 * r_lerpmodels 2 is passed on the COMMAND LINE -- the same value from
-	 * config.cfg does nothing, and dropping the MOD_NOLERP exclusion in this file
-	 * did nothing either. All three were measured on hardware, so the mechanism
-	 * is not what any of those changes assumed. Rather than guess a fourth time,
-	 * print the values this draw actually sees.
-	 *
-	 * Env-gated (same idiom as VKQ_TEXDBG in gl_texmgr.c) and rate-limited to the
-	 * first few draws per model, because UART is slow enough that unbounded
-	 * per-frame prints change the timing being measured.
-	 *
-	 * Delete this once #67 is understood -- it is a diagnostic, not a feature. */
-	{
-		static int trace_env = -1;
-		static int shots_flame = 0, shots_other = 0;
-
-		if (trace_env < 0)
-			trace_env = (getenv ("VKQ_ALIASTRACE") != NULL) ? 1 : 0;
-
-		if (trace_env == 1 && e->model != NULL)
-		{
-			const char *nm = e->model->name;
-			const int is_flame = (strstr (nm, "flame") != NULL);
-			int *shots = is_flame ? &shots_flame : &shots_other;
-
-			if (*shots < 6)
-			{
-				(*shots)++;
-				Sys_Printf (
-					"vkq-alias: %-22s nolerp=%d lerpcvar=%.0f pose1=%d pose2=%d numposes=%d "
-					"lerpblend=%.3f blend=%.3f pipe=%d alpha=%.2f atest=%d tris=%d\n",
-					nm, (e->model->flags & MOD_NOLERP) ? 1 : 0, r_lerpmodels.value, lerpdata.pose1,
-					lerpdata.pose2, paliashdr->numposes, lerpdata.blend, blend, pipeline_index,
-					entity_alpha, alphatest ? 1 : 0, showtris);
-			}
-		}
-	}
-#endif
-
 	switch (paliashdr->poseverttype)
 	{
 	case PV_QUAKE1:
