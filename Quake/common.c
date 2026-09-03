@@ -1633,6 +1633,27 @@ static void COM_CheckRegistered (void)
 	int h;
 	int i;
 
+	/* Publish the command line BEFORE the shareware early-return below.
+	 *
+	 * cmd.c Cmd_StuffCmds_f() iterates cmdline.string, so this cvar is what turns
+	 * `+map start` on the command line into an actual console command. Upstream
+	 * sets it only on the registered path (below, after the pop.lmp check), so
+	 * with SHAREWARE data every `+command` is silently ignored -- no warning; the
+	 * engine just proceeds to quake.rc's `startdemos` and plays the attract-mode
+	 * demo loop.
+	 *
+	 * All Quake testing on Phoenix runs on the free shareware pak, so no
+	 * +command has ever taken effect here, and every visual check therefore
+	 * compared HDMI frames captured at wherever the demo happened to be rather
+	 * than at a fixed viewpoint. Same fix as the quakespasm fork (b2a47ae),
+	 * where it is what finally made the wall-torch question answerable. */
+	for (i = 0; com_cmdline[i]; i++)
+	{
+		if (com_cmdline[i] != ' ')
+			break;
+	}
+	Cvar_SetROM ("cmdline", &com_cmdline[i]);
+
 	COM_OpenFile ("gfx/pop.lmp", &h, NULL);
 
 	if (h == -1)
@@ -1651,13 +1672,6 @@ static void COM_CheckRegistered (void)
 
 	COM_CloseFile (h);
 
-	for (i = 0; com_cmdline[i]; i++)
-	{
-		if (com_cmdline[i] != ' ')
-			break;
-	}
-
-	Cvar_SetROM ("cmdline", &com_cmdline[i]);
 	Cvar_SetROM ("registered", "1");
 	Con_Printf ("Playing registered version.\n");
 }
