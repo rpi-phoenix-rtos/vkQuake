@@ -213,30 +213,8 @@ static void GL_DrawAliasFrame (
 
 		VkBuffer	 vertex_buffers[3] = {paliashdr->vertex_buffer, paliashdr->vertex_buffer, paliashdr->vertex_buffer};
 
-		/* #67 SINGLE-POSE FIX (Phoenix/V3D). When pose1 == pose2 the blend above is
-		 * forced to 0, and both position bindings then resolve to the SAME buffer
-		 * offset. V3D mishandles that draw: nothing is rasterised at all. It is the
-		 * same hardware defect quakespasm hit (fork 4ef0a42), where the cure was to
-		 * leave the Pose2 vertex ATTRIBUTE unbound -- not an option in Vulkan, where
-		 * attributes are fixed by the pipeline's vertex-input state, so the binding
-		 * has to point somewhere valid.
-		 *
-		 * Point it at a DIFFERENT pose instead. At blend == 0 the shader computes
-		 * mix(Pose1, Pose2, 0.0) == Pose1, so whichever pose slot 2 names contributes
-		 * exactly nothing to the result -- only the offsets differ, which is what the
-		 * hardware needs. Measured on HW: with the offsets equal the start-map torch
-		 * flames score 0 lit pixels in both ROIs across 7 frames; forcing a real
-		 * two-pose lerp (r_lerpmodels 2, i.e. distinct offsets) scores 397-599.
-		 *
-		 * numposes <= 1 cannot produce a distinct offset, so those models are left
-		 * as they were. Nothing in the start map exercises that case -- the flames
-		 * are multi-pose -- so it stays UNVERIFIED rather than silently "fixed". */
-		int pose2bind = lerpdata.pose2;
-		if (blend == 0 && paliashdr->numposes > 1)
-			pose2bind = (lerpdata.pose1 + 1) % paliashdr->numposes;
-
 		VkDeviceSize vertex_offsets[3] = {
-			(unsigned)paliashdr->vbostofs, GLARB_GetXYZOffset (e, paliashdr, lerpdata.pose1), GLARB_GetXYZOffset (e, paliashdr, pose2bind)};
+			(unsigned)paliashdr->vbostofs, GLARB_GetXYZOffset (e, paliashdr, lerpdata.pose1), GLARB_GetXYZOffset (e, paliashdr, lerpdata.pose2)};
 		vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 3, vertex_buffers, vertex_offsets);
 		vulkan_globals.vk_cmd_bind_index_buffer (cbx->cb, paliashdr->index_buffer, 0, VK_INDEX_TYPE_UINT16);
 
@@ -329,7 +307,31 @@ void R_UpdateEntityAnimState (entity_t *e, aliashdr_t *paliashdr)
 	}
 
 	// Check blend==1 and snap previouspose
+#if defined(__phoenix__)
+	/* #67 on V3D: drop the MOD_NOLERP exclusion. Models on r_nolerp_list (the
+	 * start-map torch flames among them) are otherwise pinned to a single pose
+	 * every frame, which makes pose1 == pose2, forces blend to 0 in
+	 * GL_DrawAliasFrame, and V3D then rasterises NOTHING for that draw -- the
+	 * flames are simply absent. Taking the lerp path restores them.
+	 *
+	 * Measured, both directions, at a fixed viewpoint (scripts/check-torch-rois.py):
+	 * default cvars 0 and 0 lit px in the two archway ROIs across 7 frames; with
+	 * the lerp path (r_lerpmodels 2) 274-599, 7/7 frames, reproduced twice.
+	 *
+	 * This is a WORKAROUND, not the root cause, and it is labelled as one on
+	 * purpose -- this bug has already survived five re-diagnoses and one false
+	 * closure. What is ruled out: it is not the alpha/scanout theory (d3e329c was
+	 * a no-op -- the nobright palette already sets alpha=255 on every index), and
+	 * it is not merely the two position bindings sharing a buffer offset (binding
+	 * pose2 to a different pose while leaving blend at 0 changed nothing:
+	 * still 0 and 0). The remaining suspect is the MOD_NOLERP pose path itself.
+	 *
+	 * Cost: models upstream marks NOLERP now interpolate, so their animation is
+	 * smoother than vanilla. Visible flames beat frame-accurate invisible ones. */
+	if (r_lerpmodels.value)
+#else
 	if (r_lerpmodels.value && !(e->model->flags & MOD_NOLERP && r_lerpmodels.value != 2))
+#endif
 	{
 		float blend;
 		if (e->lerpflags & LERP_FINISH && numposes == 1)
@@ -361,7 +363,31 @@ void R_SetupAliasFrame (entity_t *e, aliashdr_t *paliashdr, int frame, lerpdata_
 	if (numposes > 1)
 		posenum += (int)(cl.time / e->lerptime) % numposes;
 
+#if defined(__phoenix__)
+	/* #67 on V3D: drop the MOD_NOLERP exclusion. Models on r_nolerp_list (the
+	 * start-map torch flames among them) are otherwise pinned to a single pose
+	 * every frame, which makes pose1 == pose2, forces blend to 0 in
+	 * GL_DrawAliasFrame, and V3D then rasterises NOTHING for that draw -- the
+	 * flames are simply absent. Taking the lerp path restores them.
+	 *
+	 * Measured, both directions, at a fixed viewpoint (scripts/check-torch-rois.py):
+	 * default cvars 0 and 0 lit px in the two archway ROIs across 7 frames; with
+	 * the lerp path (r_lerpmodels 2) 274-599, 7/7 frames, reproduced twice.
+	 *
+	 * This is a WORKAROUND, not the root cause, and it is labelled as one on
+	 * purpose -- this bug has already survived five re-diagnoses and one false
+	 * closure. What is ruled out: it is not the alpha/scanout theory (d3e329c was
+	 * a no-op -- the nobright palette already sets alpha=255 on every index), and
+	 * it is not merely the two position bindings sharing a buffer offset (binding
+	 * pose2 to a different pose while leaving blend at 0 changed nothing:
+	 * still 0 and 0). The remaining suspect is the MOD_NOLERP pose path itself.
+	 *
+	 * Cost: models upstream marks NOLERP now interpolate, so their animation is
+	 * smoother than vanilla. Visible flames beat frame-accurate invisible ones. */
+	if (r_lerpmodels.value)
+#else
 	if (r_lerpmodels.value && !(e->model->flags & MOD_NOLERP && r_lerpmodels.value != 2))
+#endif
 	{
 		if (e->lerpflags & LERP_FINISH && numposes == 1)
 			lerpdata->blend = CLAMP (0, (cl.time - e->lerpstart) / (e->lerpfinish - e->lerpstart), 1);
