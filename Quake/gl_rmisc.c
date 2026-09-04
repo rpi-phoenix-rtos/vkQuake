@@ -3018,7 +3018,7 @@ void R_CreateBasicPipelines () /* was static: Phoenix no-WSI fb0 path builds onl
 	 * CULL_MODE_NONE is the correct fix; it is scoped HERE to the basic 2D pipelines only (the
 	 * world/3D pipelines build their own infos and keep BACK-face culling). Same class as the
 	 * GLQuake-on-V3D back-face-cull fix. TODO(vkquake-port): if 3D later needs it, revisit frontFace. */
-	infos.rasterization_state.cullMode = VK_CULL_MODE_NONE;
+	base.rasterization_state.cullMode = VK_CULL_MODE_NONE;
 
 	const VkRenderPass main_render_pass = vulkan_globals.main_render_pass[MAIN_RENDER_PASS_STANDARD][MAIN_RENDER_PASS_STENCIL_CLEAR];
 	const VkRenderPass main_oit_render_pass = vulkan_globals.main_render_pass[MAIN_RENDER_PASS_OIT][MAIN_RENDER_PASS_STENCIL_CLEAR];
