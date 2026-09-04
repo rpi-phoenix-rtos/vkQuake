@@ -1160,9 +1160,10 @@ static void R_FlushBatch (
 	{
 		int pipeline_index =
 			(fullbright_enabled ? 1 : 0) + (alpha_test ? 2 : 0) + (alpha_blend ? 4 : 0) + (vid_filter.value != 0 && vid_palettize.value != 0 ? 8 : 0);
-		vulkan_pipeline_t pipeline = cbx->render_pass_index == RENDER_PASS_INDEX_WBOIT
-										 ? vulkan_globals.world_wboit_pipelines[pipeline_index]
-										 : vulkan_globals.world_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index];
+		vulkan_pipeline_t pipeline = R_PipelineForRenderPass (
+			cbx->render_pass_index, vulkan_globals.world_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index],
+			vulkan_globals.world_wboit_pipelines[pipeline_index], vulkan_globals.world_mboit_moment_pipelines[pipeline_index],
+			vulkan_globals.world_mboit_composite_pipelines[pipeline_index]);
 		R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
 		float constant_factor = 0.0f, slope_factor = 0.0f;
@@ -1279,6 +1280,10 @@ void R_DrawTextureChains_Water (cb_context_t *cbx, qmodel_t *model, entity_t *en
 	if (r_lightmap_cheatsafe)
 		vulkan_globals.vk_cmd_bind_descriptor_sets (
 			cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.world_pipeline_layout.handle, 0, 1, &greytexture->descriptor_set, 0, NULL);
+	vulkan_globals.vk_cmd_bind_descriptor_sets (
+		cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.world_pipeline_layout.handle, 4, 1, &vulkan_globals.bmodel_instances_desc_set, 0, NULL);
+	const uint32_t instance_base = 0; // texture chain draws bake the entity transform into the mvp push constant
+	R_PushConstants (cbx, VK_SHADER_STAGE_ALL_GRAPHICS, 21 * sizeof (float), sizeof (uint32_t), &instance_base);
 
 	uint32_t brushpasses = 0;
 	for (type = TEXTYPE_FIRSTLIQUID; type <= TEXTYPE_LASTLIQUID; ++type)
@@ -1348,6 +1353,7 @@ void R_DrawTextureChains_Multitexture (cb_context_t *cbx, qmodel_t *model, entit
 	qboolean	 alpha_test = false;
 	qboolean	 alpha_blend = alpha < 1.0f;
 	qboolean	 use_zbias = (gl_zfix.value && model != cl.worldmodel);
+	qboolean	 is_static = ent != NULL && ent->is_static;
 	int			 lastlightmap;
 	int			 ent_frame = ent != NULL ? ent->frame : 0;
 	gltexture_t *fullbright = NULL;
@@ -1360,6 +1366,10 @@ void R_DrawTextureChains_Multitexture (cb_context_t *cbx, qmodel_t *model, entit
 	if (r_lightmap_cheatsafe)
 		vulkan_globals.vk_cmd_bind_descriptor_sets (
 			cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.world_pipeline_layout.handle, 0, 1, &greytexture->descriptor_set, 0, NULL);
+	vulkan_globals.vk_cmd_bind_descriptor_sets (
+		cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.world_pipeline_layout.handle, 4, 1, &vulkan_globals.bmodel_instances_desc_set, 0, NULL);
+	const uint32_t instance_base = 0; // texture chain draws bake the entity transform into the mvp push constant
+	R_PushConstants (cbx, VK_SHADER_STAGE_ALL_GRAPHICS, 21 * sizeof (float), sizeof (uint32_t), &instance_base);
 
 	if (alpha_blend)
 	{
@@ -1388,6 +1398,8 @@ void R_DrawTextureChains_Multitexture (cb_context_t *cbx, qmodel_t *model, entit
 
 		lastlightmap = -1; // avoid compiler warning
 		alpha_test = t->type == TEXTYPE_CUTOUT;
+		const qboolean is_decal = is_static && alpha_test;
+		const qboolean texture_zbias = use_zbias && !is_decal;
 
 		texture_t	*texture = R_TextureAnimation (t, ent_frame);
 		gltexture_t *gl_texture = texture->gltexture;
@@ -1399,15 +1411,15 @@ void R_DrawTextureChains_Multitexture (cb_context_t *cbx, qmodel_t *model, entit
 		{
 			if (s->lightmaptexturenum != lastlightmap)
 			{
-				R_FlushBatch (cbx, fullbright_enabled, alpha_test, alpha_blend, use_zbias, lightmap_texture, &brushpasses);
+				R_FlushBatch (cbx, fullbright_enabled, alpha_test, alpha_blend, texture_zbias, lightmap_texture, &brushpasses);
 				lightmap_texture = lightmaps[s->lightmaptexturenum].texture;
 			}
 
 			lastlightmap = s->lightmaptexturenum;
-			R_BatchSurface (cbx, s, fullbright_enabled, alpha_test, alpha_blend, use_zbias, lightmap_texture, &brushpasses);
+			R_BatchSurface (cbx, s, fullbright_enabled, alpha_test, alpha_blend, texture_zbias, lightmap_texture, &brushpasses);
 		}
 
-		R_FlushBatch (cbx, fullbright_enabled, alpha_test, alpha_blend, use_zbias, lightmap_texture, &brushpasses);
+		R_FlushBatch (cbx, fullbright_enabled, alpha_test, alpha_blend, texture_zbias, lightmap_texture, &brushpasses);
 	}
 
 	Atomic_AddUInt32 (&rs_brushpasses, brushpasses);

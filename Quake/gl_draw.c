@@ -29,6 +29,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 extern cvar_t scr_style;
 
 cvar_t scr_conalpha = {"scr_conalpha", "0.5", CVAR_ARCHIVE}; // johnfitz
+// 0 = nearest, 1 = linear, 2 = xBR Level 2. World texture filtering remains independent.
+cvar_t scr_guifilter = {"scr_guifilter", "0", CVAR_ARCHIVE};
 
 qpic_t *draw_disc;
 qpic_t *draw_backtile;
@@ -84,19 +86,30 @@ typedef struct
 //  PIC CACHING
 //
 //==============================================================================
-
 typedef struct cachepic_s
 {
-	char   name[MAX_QPATH];
-	qpic_t pic;
-	byte   padding[32]; // for appended glpic
+	// dynamically-allocated chained cachepic_t
+	struct cachepic_s *next;
+	char			   name[MAX_QPATH];
+	int				   picflags;
+	qpic_t			   pic;
+	byte			   padding[32];
 } cachepic_t;
 
-#define MAX_CACHED_PICS 512 // Spike -- increased to avoid csqc issues.
-cachepic_t menu_cachepics[MAX_CACHED_PICS];
-int		   menu_numcachepics;
+// For appended glpic paylaod, padding MUST by placed just AFTER pic and being of enough size to hold glpic_t.
+// (Technically the total padding size is (pic.data[4] + padding[32]) but we discard pic.data size in this check)
+COMPILE_TIME_ASSERT ("cachepic padding placement", offsetof (cachepic_t, padding) == offsetof (cachepic_t, pic) + sizeof (((struct cachepic_s *)0)->pic));
+COMPILE_TIME_ASSERT ("cachepic padding size", sizeof (((struct cachepic_s *)0)->padding) >= sizeof (glpic_t));
 
-byte menuplyr_pixels[4096];
+// draw_qcvm_mutex also protects q_cachepics  / scrap updates
+extern SDL_Mutex  *draw_qcvm_mutex;
+static cachepic_t *q_cachepics;
+
+// last entry of the chained q_cachepics, new entries are appended to it
+static cachepic_t *q_cachepics_last_entry;
+
+// Fast lookup pic name => cachepic_t* for q_cachepics.
+static hash_map_t *q_cachepics_map;
 
 //  scrap allocation
 //  Allocate all the little status bar obejcts into a single texture
@@ -118,7 +131,7 @@ Scrap_AllocBlock
 returns an index into scrap_texnums[] and the position inside it
 ================
 */
-int Scrap_AllocBlock (int w, int h, int *x, int *y)
+static int Scrap_AllocBlock (int w, int h, int *x, int *y)
 {
 	int i, j;
 	int best, best2;
@@ -164,7 +177,7 @@ int Scrap_AllocBlock (int w, int h, int *x, int *y)
 Scrap_Upload -- johnfitz -- now uses TexMgr
 ================
 */
-void Scrap_Upload (void)
+static void Scrap_Upload (void)
 {
 	char name[8];
 	int	 i;
@@ -185,36 +198,48 @@ void Scrap_Upload (void)
 Draw_PicFromWad
 ================
 */
-qpic_t *Draw_PicFromWad2 (const char *name, unsigned int texflags)
+qpic_t *Draw_PicFromWad2 (const char *name, unsigned int texflags, int picflags)
 {
 	int			 i;
-	cachepic_t	*pic;
 	qpic_t		*p;
+	cachepic_t	*pic;
 	glpic_t		 gl;
 	src_offset_t offset; // johnfitz
 	lumpinfo_t	*info;
 
-	// Spike -- added cachepic stuff here, to avoid glitches if the function is called multiple times with the same image.
-	for (pic = menu_cachepics, i = 0; i < menu_numcachepics; pic++, i++)
-	{
-		if (!strcmp (name, pic->name))
-			return &pic->pic;
-	}
-	if (menu_numcachepics == MAX_CACHED_PICS)
-		Sys_Error ("menu_numcachepics == MAX_CACHED_PICS");
+	// Fast lookup:
+	p = Draw_GetCachedPic (name);
 
+	if (p)
+		return p;
+
+	// not cached, searched for it:
 	p = (qpic_t *)W_GetLumpName (name, &info);
+
 	if (!p)
 	{
-		Con_SafePrintf ("W_GetLumpName: %s not found\n", name);
+		Con_Warning ("W_GetLumpName: %s not found\n", name);
 		return pic_nul; // johnfitz
 	}
 	if (info->type != TYP_QPIC)
-		Sys_Error ("Draw_PicFromWad: lump \"%s\" is not a qpic", name);
+	{
+		// can be another format that QPIC (.lmp), ex. png, tga, jpg, pcx , this is not an error at that point
+		Con_DPrintf ("Draw_PicFromWad: lump \"%s\" is not a qpic\n", name);
+		return pic_nul; // johnfitz
+	}
+
+	// We have TYP_QPIC, check its basic characteristics:
 	if (info->size < (int)(sizeof (int) * 2) || sizeof (int) * 2 + p->width * p->height > (size_t)info->size)
-		Sys_Error ("Draw_PicFromWad: pic \"%s\" truncated", name);
+	{
+		Con_Warning ("Draw_PicFromWad: pic \"%s\" truncated\n", name);
+		return pic_nul; // johnfitz
+	}
+
 	if (p->width < 0 || p->height < 0)
-		Sys_Error ("Draw_PicFromWad: bad size (%dx%d) for pic \"%s\"", p->width, p->height, name);
+	{
+		Con_Warning ("Draw_PicFromWad: bad size (%dx%d) for pic \"%s\"\n", p->width, p->height, name);
+		return pic_nul; // johnfitz
+	}
 
 	// load little ones into the scrap
 	if (p->width < 64 && p->height < 64)
@@ -253,17 +278,39 @@ qpic_t *Draw_PicFromWad2 (const char *name, unsigned int texflags)
 		gl.th = 1;
 	}
 
-	menu_numcachepics++;
-	strcpy (pic->name, name);
+	// Create a new pic:
+	pic = Mem_Alloc (sizeof (*pic));
+	pic->picflags = picflags;
+
+	q_strlcpy (pic->name, name, countof (pic->name));
 	pic->pic = *p;
-	memcpy (pic->pic.data, &gl, sizeof (glpic_t));
+
+	memcpy ((void *)&(pic->pic.data), &gl, sizeof (glpic_t));
+
+	// Add to cache:
+	assert (pic->next == NULL);
+
+	if (!q_cachepics)
+	{
+		q_cachepics = pic;
+		q_cachepics_last_entry = pic;
+	}
+	else
+	{
+		q_cachepics_last_entry->next = pic;
+		q_cachepics_last_entry = pic;
+	}
+
+	// we must degrade pic->name to a (const char*) because this is what the hashmap expects (8 bytes pointer)
+	const char *pic_name_as_pointer = &pic->name[0];
+	HashMap_Insert (q_cachepics_map, &pic_name_as_pointer, &pic);
 
 	return &pic->pic;
 }
 
 qpic_t *Draw_PicFromWad (const char *name)
 {
-	return Draw_PicFromWad2 (name, TEXPREF_ALPHA | TEXPREF_PAD | TEXPREF_NOPICMIP);
+	return Draw_PicFromWad2 (name, TEXPREF_ALPHA | TEXPREF_PAD | TEXPREF_NOPICMIP, PICFLAG_AUTO);
 }
 #if 0 // vso - unused 
 static qpic_t *Draw_GetCachedPic (const char *path)
@@ -281,61 +328,107 @@ static qpic_t *Draw_GetCachedPic (const char *path)
 #endif
 /*
 ================
+Draw_GetCachedPic : get a pic from cache if already present, or return NULL if not.
+================
+*/
+qpic_t *Draw_GetCachedPic (const char *path)
+{
+	// Fast lookup:
+	cachepic_t **pic_ptr = HashMap_Lookup (cachepic_t *, q_cachepics_map, &path);
+
+	// found
+	if (pic_ptr)
+	{
+		return &((*pic_ptr)->pic);
+	}
+
+	return NULL;
+}
+
+/*
+================
 Draw_CachePic
 ================
 */
-qpic_t *Draw_TryCachePic (const char *path, unsigned int texflags)
+qpic_t *Draw_TryCachePic (const char *path, unsigned int texflags, int picflags)
 {
+	qpic_t	   *p;
 	cachepic_t *pic;
-	int			i;
-	qpic_t	   *dat;
 	glpic_t		gl;
 
-	for (pic = menu_cachepics, i = 0; i < menu_numcachepics; pic++, i++)
-	{
-		if (!strcmp (path, pic->name))
-			return &pic->pic;
-	}
-	if (menu_numcachepics == MAX_CACHED_PICS)
-		Sys_Error ("menu_numcachepics == MAX_CACHED_PICS");
+	// Fast lookup:
+	p = Draw_GetCachedPic (path);
+
+	if (p)
+		return p;
 
 	//
 	// load the pic from disk
 	//
-	dat = (qpic_t *)COM_LoadFile (path, NULL);
-	if (!dat)
+	unsigned int   pic_width = 0;
+	unsigned int   pic_height = 0;
+	void		  *pic_data = NULL;
+	//
+	enum srcformat pic_fmt = SRC_INDEXED;
+
+	// Image_LoadImage works without file extensions.
+	char npath[MAX_QPATH];
+	COM_StripExtension (path, npath, sizeof (npath));
+
+	pic_data = Image_LoadImage (npath, (int *)&pic_width, (int *)&pic_height, &pic_fmt, 0);
+
+	if (!pic_data)
+	{
 		return NULL;
-	SwapPic (dat);
+	}
 
-	menu_numcachepics++;
-	strcpy (pic->name, path);
+	// Create a new pic:
+	pic = Mem_Alloc (sizeof (*pic));
+	pic->picflags = picflags;
 
-	// HACK HACK HACK --- we need to keep the bytes for
-	// the translatable player picture just for the menu
-	// configuration dialog
-	if (!strcmp (path, "gfx/menuplyr.lmp"))
-		memcpy (menuplyr_pixels, dat->data, dat->width * dat->height);
+	q_strlcpy (pic->name, path, countof (pic->name));
 
-	pic->pic.width = dat->width;
-	pic->pic.height = dat->height;
+	pic->pic.width = pic_width;
+	pic->pic.height = pic_height;
 
-	gl.gltexture = TexMgr_LoadImage (
-		NULL, path, dat->width, dat->height, SRC_INDEXED, dat->data, path, sizeof (int) * 2, texflags | TEXPREF_NOPICMIP); // johnfitz -- TexMgr
+	// pass the extensionless name as the source so TexMgr_ReloadImage can find the image
+	// again through Image_LoadImage (needed to recolor gfx/menuplyr.lmp in the setup menu)
+	gl.gltexture = TexMgr_LoadImage (NULL, path, pic_width, pic_height, pic_fmt, pic_data, npath, 0, texflags | TEXPREF_NOPICMIP); // johnfitz -- TexMgr
+
+	// those are always normalized coordinates
 	gl.sl = 0;
 	gl.sh = 1;
 	gl.tl = 0;
 	gl.th = 1;
 
-	memcpy (pic->pic.data, &gl, sizeof (glpic_t));
+	memcpy ((void *)&(pic->pic.data), &gl, sizeof (glpic_t));
 
-	Mem_Free (dat);
+	// Add to cache:
+	assert (pic->next == NULL);
+
+	if (!q_cachepics)
+	{
+		q_cachepics = pic;
+		q_cachepics_last_entry = pic;
+	}
+	else
+	{
+		q_cachepics_last_entry->next = pic;
+		q_cachepics_last_entry = pic;
+	}
+
+	// we must degrade pic->name to a (const char*) because this is what the hashmap expects (8 bytes pointer)
+	const char *pic_name_as_pointer = &pic->name[0];
+	HashMap_Insert (q_cachepics_map, &pic_name_as_pointer, &pic);
+
+	Mem_Free (pic_data);
 
 	return &pic->pic;
 }
 
 qpic_t *Draw_CachePic (const char *path)
 {
-	qpic_t *pic = Draw_TryCachePic (path, TEXPREF_ALPHA | TEXPREF_PAD | TEXPREF_NOPICMIP);
+	qpic_t *pic = Draw_TryCachePic (path, TEXPREF_ALPHA | TEXPREF_PAD | TEXPREF_NOPICMIP, PICFLAG_AUTO);
 	if (!pic)
 		Sys_Error ("Draw_CachePic: failed to load %s", path);
 	return pic;
@@ -361,7 +454,8 @@ static qpic_t *Draw_MakePic (const char *name, int width, int height, const byte
 	gl.sh = 1;
 	gl.tl = 0;
 	gl.th = 1;
-	memcpy (pic->data, &gl, sizeof (glpic_t));
+
+	memcpy ((void *)&(pic->data), &gl, sizeof (glpic_t));
 
 	return pic;
 }
@@ -401,8 +495,7 @@ Draw_NewGame -- johnfitz
 */
 void Draw_NewGame (void)
 {
-	cachepic_t *pic;
-	int			i;
+	SDL_LockMutex (draw_qcvm_mutex);
 
 	// empty scrap and reallocate gltextures
 	memset (scrap_allocated, 0, sizeof (scrap_allocated));
@@ -410,17 +503,28 @@ void Draw_NewGame (void)
 
 	Scrap_Upload (); // creates 2 empty gltextures
 
-	// empty lmp cache
-	for (pic = menu_cachepics, i = 0; i < menu_numcachepics; pic++, i++)
-		pic->name[0] = 0;
-	menu_numcachepics = 0;
+	// empty pic cache :
+	cachepic_t *cached_pic = q_cachepics;
+	cachepic_t *next_cached_pic;
+
+	while (cached_pic)
+	{
+		next_cached_pic = cached_pic->next;
+		Mem_Free (cached_pic);
+		cached_pic = next_cached_pic;
+	}
+	q_cachepics = NULL;
+	q_cachepics_last_entry = NULL;
+
+	HashMap_Clear (q_cachepics_map);
 
 	// reload wad pics
 	W_LoadWadFile (); // johnfitz -- filename is now hard-coded for honesty
 	Draw_LoadPics ();
 	SCR_LoadPics ();
 	Sbar_LoadPics ();
-	PR_ReloadPics (false);
+
+	SDL_UnlockMutex (draw_qcvm_mutex);
 }
 
 /*
@@ -430,7 +534,10 @@ Draw_Init -- johnfitz -- rewritten
 */
 void Draw_Init (void)
 {
+	q_cachepics_map = HashMap_Create (const char *, cachepic_t *, &HashStr, &HashStrCmp);
+
 	Cvar_RegisterVariable (&scr_conalpha);
+	Cvar_RegisterVariable (&scr_guifilter);
 
 	// clear scrap and allocate gltextures
 	memset (scrap_allocated, 0, sizeof (scrap_allocated));
@@ -453,30 +560,57 @@ void Draw_Init (void)
 //
 //==============================================================================
 
+static float canvas_color[4] = {1.0f, 1.0f, 1.0f, 1.0f};
+
+/*
+================
+GL_SetCanvasColor
+================
+*/
+void GL_SetCanvasColor (float r, float g, float b, float a)
+{
+	canvas_color[0] = r;
+	canvas_color[1] = g;
+	canvas_color[2] = b;
+	canvas_color[3] = a;
+}
+
 /*
 ================
 Draw_FillCharacterQuad
 ================
 */
-static void Draw_FillCharacterQuad (float x, float y, char num, basicvertex_t *output, int rotation)
+static void Draw_FillCharacterQuadScaled (float x, float y, float scale, char num, draw_pic_vertex_t *output, int rotation)
 {
-	const int	row = num >> 4;
-	const int	col = num & 15;
+	const int	glyph = (unsigned char)num;
+	const int	row = glyph >> 4;
+	const int	col = glyph & 15;
 	const float st_size = 1.0f / 16.0f;
 	// Fixes sampling into previous/next character because of float rounding
 	const float texel_offset = 0.001f;
 	const float frow = row * st_size;
 	const float fcol = col * st_size;
 
-	basicvertex_t corner_verts[4];
+	draw_pic_vertex_t corner_verts[4];
 	memset (&corner_verts, 255, sizeof (corner_verts));
 
-	float texcoords[4][2] = {
-		{x, y},
-		{x + CHARACTER_SIZE, y},
-		{x + CHARACTER_SIZE, y + CHARACTER_SIZE},
-		{x, y + CHARACTER_SIZE},
-	};
+	const float size = CHARACTER_SIZE * scale;
+	float		texcoords[4][2] = {
+		  {x, y},
+		  {x + size, y},
+		  {x + size, y + size},
+		  {x, y + size},
+	  };
+
+	for (int i = 0; i < 4; ++i)
+	{
+		for (int j = 0; j < 4; ++j)
+			corner_verts[i].color[j] = (byte)(canvas_color[j] * 255.0f);
+		corner_verts[i].texture_region[0] = fcol;
+		corner_verts[i].texture_region[1] = frow;
+		corner_verts[i].texture_region[2] = fcol + st_size;
+		corner_verts[i].texture_region[3] = frow + st_size;
+	}
 
 	corner_verts[0].position[0] = texcoords[(rotation + 0) % 4][0];
 	corner_verts[0].position[1] = texcoords[(rotation + 0) % 4][1];
@@ -510,6 +644,29 @@ static void Draw_FillCharacterQuad (float x, float y, char num, basicvertex_t *o
 	output[5] = corner_verts[0];
 }
 
+static void Draw_FillCharacterQuad (float x, float y, char num, draw_pic_vertex_t *output, int rotation)
+{
+	Draw_FillCharacterQuadScaled (x, y, 1.0f, num, output, rotation);
+}
+
+static void Draw_BindPicState (cb_context_t *cbx, gltexture_t *texture, qboolean alpha_blend, qboolean force_linear)
+{
+	const qboolean xbr = !force_linear && (int)scr_guifilter.value == 2;
+	if (xbr)
+		R_BindPipeline (
+			cbx, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			alpha_blend ? vulkan_globals.menu_xbr_blend_pipeline[cbx->render_pass_index] : vulkan_globals.menu_xbr_pipeline[cbx->render_pass_index]);
+	else
+		R_BindPipeline (
+			cbx, VK_PIPELINE_BIND_POINT_GRAPHICS,
+			alpha_blend ? vulkan_globals.gui_blend_pipeline[cbx->render_pass_index] : vulkan_globals.gui_pipeline[cbx->render_pass_index]);
+
+	VkDescriptorSet descriptor_sets[2] = {
+		texture->descriptor_set, vulkan_globals.gui_sampler_descriptor_sets[force_linear || (int)scr_guifilter.value == 1 ? 1 : 0]};
+	vkCmdBindDescriptorSets (
+		cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.gui_pipeline_layout.handle, 0, countof (descriptor_sets), descriptor_sets, 0, NULL);
+}
+
 /*
 ================
 Draw_Character
@@ -526,16 +683,13 @@ void Draw_Character (cb_context_t *cbx, float x, float y, int num)
 	if (num == 32)
 		return; // don't waste verts on spaces
 
-	VkBuffer	   buffer;
-	VkDeviceSize   buffer_offset;
-	basicvertex_t *vertices = (basicvertex_t *)R_VertexAllocate (6 * sizeof (basicvertex_t), &buffer, &buffer_offset);
-
+	VkBuffer		   buffer;
+	VkDeviceSize	   buffer_offset;
+	draw_pic_vertex_t *vertices = (draw_pic_vertex_t *)R_VertexAllocate (6 * sizeof (*vertices), &buffer, &buffer_offset);
 	Draw_FillCharacterQuad (x, y, (char)num, vertices, rotation);
 
 	vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &buffer, &buffer_offset);
-	R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_alphatest_pipeline[cbx->render_pass_index]);
-	vulkan_globals.vk_cmd_bind_descriptor_sets (
-		cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_pipeline_layout.handle, 0, 1, &char_texture->descriptor_set, 0, NULL);
+	Draw_BindPicState (cbx, char_texture, canvas_color[3] < 1.0f, false);
 	vulkan_globals.vk_cmd_draw (cbx->cb, 6, 1, 0, 0);
 }
 
@@ -557,9 +711,9 @@ void Draw_String (cb_context_t *cbx, float x, float y, const char *str)
 		if (*tmp != 32)
 			num_verts += 6;
 
-	VkBuffer	   buffer;
-	VkDeviceSize   buffer_offset;
-	basicvertex_t *vertices = (basicvertex_t *)R_VertexAllocate (num_verts * sizeof (basicvertex_t), &buffer, &buffer_offset);
+	VkBuffer		   buffer;
+	VkDeviceSize	   buffer_offset;
+	draw_pic_vertex_t *vertices = (draw_pic_vertex_t *)R_VertexAllocate (num_verts * sizeof (*vertices), &buffer, &buffer_offset);
 
 	for (i = 0; *str != 0; ++str)
 	{
@@ -572,9 +726,45 @@ void Draw_String (cb_context_t *cbx, float x, float y, const char *str)
 	}
 
 	vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &buffer, &buffer_offset);
-	R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_alphatest_pipeline[cbx->render_pass_index]);
-	vulkan_globals.vk_cmd_bind_descriptor_sets (
-		cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_pipeline_layout.handle, 0, 1, &char_texture->descriptor_set, 0, NULL);
+	Draw_BindPicState (cbx, char_texture, canvas_color[3] < 1.0f, false);
+	vulkan_globals.vk_cmd_draw (cbx->cb, num_verts, 1, 0, 0);
+}
+
+/*
+================
+Draw_String_Scaled
+================
+*/
+void Draw_String_Scaled (cb_context_t *cbx, float x, float y, const char *str, float scale)
+{
+	int			num_verts = 0;
+	int			i;
+	const char *tmp;
+	const float size = CHARACTER_SIZE * scale;
+
+	if (y <= -size)
+		return;
+
+	for (tmp = str; *tmp != 0; ++tmp)
+		if (*tmp != 32)
+			num_verts += 6;
+
+	VkBuffer		   buffer;
+	VkDeviceSize	   buffer_offset;
+	draw_pic_vertex_t *vertices = (draw_pic_vertex_t *)R_VertexAllocate (num_verts * sizeof (*vertices), &buffer, &buffer_offset);
+
+	for (i = 0; *str != 0; ++str)
+	{
+		if (*str != 32)
+		{
+			Draw_FillCharacterQuadScaled (x, y, scale, *str, vertices + i * 6, 0);
+			i++;
+		}
+		x += size;
+	}
+
+	vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &buffer, &buffer_offset);
+	Draw_BindPicState (cbx, char_texture, canvas_color[3] < 1.0f, false);
 	vulkan_globals.vk_cmd_draw (cbx->cb, num_verts, 1, 0, 0);
 }
 
@@ -582,7 +772,7 @@ void Draw_String (cb_context_t *cbx, float x, float y, const char *str)
 =============
 Draw_Pic -- johnfitz -- modified
 =============
-*/
+ */
 void Draw_Pic (cb_context_t *cbx, float x, float y, qpic_t *pic, float alpha, qboolean alpha_blend)
 {
 	glpic_t gl;
@@ -592,11 +782,11 @@ void Draw_Pic (cb_context_t *cbx, float x, float y, qpic_t *pic, float alpha, qb
 		Scrap_Upload ();
 	memcpy (&gl, pic->data, sizeof (glpic_t));
 
-	VkBuffer	   buffer;
-	VkDeviceSize   buffer_offset;
-	basicvertex_t *vertices = (basicvertex_t *)R_VertexAllocate (6 * sizeof (basicvertex_t), &buffer, &buffer_offset);
+	VkBuffer		   buffer;
+	VkDeviceSize	   buffer_offset;
+	draw_pic_vertex_t *vertices = (draw_pic_vertex_t *)R_VertexAllocate (6 * sizeof (*vertices), &buffer, &buffer_offset);
 
-	basicvertex_t corner_verts[4];
+	draw_pic_vertex_t corner_verts[4];
 	memset (&corner_verts, 255, sizeof (corner_verts));
 
 	corner_verts[0].position[0] = x;
@@ -624,7 +814,13 @@ void Draw_Pic (cb_context_t *cbx, float x, float y, qpic_t *pic, float alpha, qb
 	corner_verts[3].texcoord[1] = gl.th;
 
 	for (i = 0; i < 4; ++i)
+	{
 		corner_verts[i].color[3] = alpha * 255.0f;
+		corner_verts[i].texture_region[0] = gl.sl;
+		corner_verts[i].texture_region[1] = gl.tl;
+		corner_verts[i].texture_region[2] = gl.sh;
+		corner_verts[i].texture_region[3] = gl.th;
+	}
 
 	vertices[0] = corner_verts[0];
 	vertices[1] = corner_verts[1];
@@ -634,19 +830,16 @@ void Draw_Pic (cb_context_t *cbx, float x, float y, qpic_t *pic, float alpha, qb
 	vertices[5] = corner_verts[0];
 
 	vkCmdBindVertexBuffers (cbx->cb, 0, 1, &buffer, &buffer_offset);
-	if (alpha_blend)
-		R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_blend_pipeline[cbx->render_pass_index]);
-	else
-		R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_alphatest_pipeline[cbx->render_pass_index]);
-	vkCmdBindDescriptorSets (
-		cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_pipeline_layout.handle, 0, 1, &gl.gltexture->descriptor_set, 0, NULL);
+	Draw_BindPicState (cbx, gl.gltexture, alpha_blend, false);
 	vkCmdDraw (cbx->cb, 6, 1, 0, 0);
 }
 
-void Draw_SubPic (cb_context_t *cbx, float x, float y, float w, float h, qpic_t *pic, float s1, float t1, float s2, float t2, float *rgb, float alpha)
+static void Draw_SubPicInternal (
+	cb_context_t *cbx, float x, float y, float w, float h, qpic_t *pic, float s1, float t1, float s2, float t2, float *rgb, float alpha, qboolean force_linear,
+	qboolean force_blend)
 {
 	glpic_t	 gl;
-	qboolean alpha_blend = alpha < 1.0f;
+	qboolean alpha_blend = force_blend || alpha < 1.0f;
 	int		 i;
 	if (alpha <= 0.0f)
 		return;
@@ -668,11 +861,11 @@ void Draw_SubPic (cb_context_t *cbx, float x, float y, float w, float h, qpic_t 
 	}
 	rgba[3] *= alpha;
 
-	VkBuffer	   buffer;
-	VkDeviceSize   buffer_offset;
-	basicvertex_t *vertices = (basicvertex_t *)R_VertexAllocate (6 * sizeof (basicvertex_t), &buffer, &buffer_offset);
+	VkBuffer		   buffer;
+	VkDeviceSize	   buffer_offset;
+	draw_pic_vertex_t *vertices = (draw_pic_vertex_t *)R_VertexAllocate (6 * sizeof (*vertices), &buffer, &buffer_offset);
 
-	basicvertex_t corner_verts[4];
+	draw_pic_vertex_t corner_verts[4];
 	memset (&corner_verts, 255, sizeof (corner_verts));
 
 	corner_verts[0].position[0] = x;
@@ -705,6 +898,10 @@ void Draw_SubPic (cb_context_t *cbx, float x, float y, float w, float h, qpic_t 
 		corner_verts[i].color[1] = rgba[1];
 		corner_verts[i].color[2] = rgba[2];
 		corner_verts[i].color[3] = rgba[3];
+		corner_verts[i].texture_region[0] = corner_verts[0].texcoord[0];
+		corner_verts[i].texture_region[1] = corner_verts[0].texcoord[1];
+		corner_verts[i].texture_region[2] = corner_verts[2].texcoord[0];
+		corner_verts[i].texture_region[3] = corner_verts[2].texcoord[1];
 	}
 
 	vertices[0] = corner_verts[0];
@@ -715,13 +912,24 @@ void Draw_SubPic (cb_context_t *cbx, float x, float y, float w, float h, qpic_t 
 	vertices[5] = corner_verts[0];
 
 	vkCmdBindVertexBuffers (cbx->cb, 0, 1, &buffer, &buffer_offset);
-	if (alpha_blend)
-		R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_blend_pipeline[cbx->render_pass_index]);
-	else
-		R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_alphatest_pipeline[cbx->render_pass_index]);
-	vkCmdBindDescriptorSets (
-		cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.basic_pipeline_layout.handle, 0, 1, &gl.gltexture->descriptor_set, 0, NULL);
+	Draw_BindPicState (cbx, gl.gltexture, alpha_blend, force_linear);
 	vkCmdDraw (cbx->cb, 6, 1, 0, 0);
+}
+
+void Draw_SubPic (cb_context_t *cbx, float x, float y, float w, float h, qpic_t *pic, float s1, float t1, float s2, float t2, float *rgb, float alpha)
+{
+	Draw_SubPicInternal (cbx, x, y, w, h, pic, s1, t1, s2, t2, rgb, alpha, false, false);
+}
+
+void Draw_SubPicLinear (cb_context_t *cbx, float x, float y, float w, float h, qpic_t *pic, float s1, float t1, float s2, float t2, float *rgb, float alpha)
+{
+	Draw_SubPicInternal (cbx, x, y, w, h, pic, s1, t1, s2, t2, rgb, alpha, true, false);
+}
+
+void Draw_SubPicLinearBlend (
+	cb_context_t *cbx, float x, float y, float w, float h, qpic_t *pic, float s1, float t1, float s2, float t2, float *rgb, float alpha)
+{
+	Draw_SubPicInternal (cbx, x, y, w, h, pic, s1, t1, s2, t2, rgb, alpha, true, true);
 }
 
 /*

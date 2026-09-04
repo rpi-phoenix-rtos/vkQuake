@@ -263,15 +263,12 @@ void Cmd_StuffCmds_f (void)
 	Cbuf_InsertText (cmds);
 }
 
-/*
-===============
-Cmd_Exec_f
-===============
-*/
 void Cmd_Exec_f (void)
 {
-	char *buf = NULL;
-	FILE *f = NULL;
+	char	   *buf = NULL;
+	const char *display_path;
+	const char *path;
+	qboolean	legacy_config_alias;
 
 	if (Cmd_Argc () != 2)
 	{
@@ -279,40 +276,77 @@ void Cmd_Exec_f (void)
 		return;
 	}
 
-	if (multiuser)
+	path = Cmd_Argv (1);
+	display_path = path;
+	legacy_config_alias = !q_strcasecmp (path, "config.cfg") || !q_strcasecmp (path, CONFIG_NAME);
+
+	if (legacy_config_alias)
 	{
-		char *pref_path = SDL_GetPrefPath ("", "vkQuake");
-		f = fopen (va ("%s/%s", pref_path, Cmd_Argv (1)), "rb");
-		SDL_free (pref_path);
-	}
-	qboolean read_from_pref_path = false;
-	if (f)
-	{
-		fseek (f, 0, SEEK_END);
-		long length = ftell (f);
-		fseek (f, 0, SEEK_SET);
-		buf = Mem_Alloc (length + 1);
-		if (fread (buf, 1, length, f) != length)
-			Mem_Free (buf);
-		else
+		FILE	   *f;
+		char	   *game_buf;
+		qfilesize_t length;
+
+		f = COM_FOpenConfigFile (true, "rb");
+		if (f)
 		{
-			buf[length] = 0;
-			read_from_pref_path = true;
+			length = Sys_filelength (f);
+			buf = Mem_Alloc (length + 1);
+			if (fread (buf, 1, length, f) != length)
+			{
+				Mem_Free (buf);
+				buf = NULL;
+			}
+			else
+				buf[length] = 0;
+			fclose (f);
 		}
-		fclose (f);
-	}
-	if (!read_from_pref_path)
-	{
-		buf = (char *)COM_LoadFile (Cmd_Argv (1), NULL);
-		if (!buf)
+		game_buf = (char *)COM_LoadFile (path, NULL);
+		// The portable compatibility fallback and the game search can resolve
+		// to the same old id1 config. Execute it only once.
+		if (buf && game_buf && !strcmp (buf, game_buf))
+		{
+			Mem_Free (game_buf);
+			game_buf = NULL;
+		}
+		if (!buf && !game_buf)
 		{
 			if (cmd_warncmd.value)
-				Con_Printf ("couldn't exec %s\n", Cmd_Argv (1));
+				Con_Printf ("couldn't exec %s\n", path);
 			return;
 		}
+
+		if (cmd_warncmd.value)
+		{
+			if (buf)
+				Con_Printf ("execing %s\n", CONFIG_NAME);
+			if (game_buf)
+				Con_Printf ("execing %s\n", path);
+		}
+
+		Cbuf_InsertText ("\n"); // just in case there was no trailing \n.
+		// InsertText prepends, so insert the game config first to execute the
+		// global config before it.
+		if (game_buf)
+			Cbuf_InsertText (game_buf);
+		if (buf)
+			Cbuf_InsertText (buf);
+
+		Mem_Free (game_buf);
+		Mem_Free (buf);
+		return;
 	}
+	else
+		buf = (char *)COM_LoadFile (path, NULL);
+
+	if (!buf)
+	{
+		if (cmd_warncmd.value)
+			Con_Printf ("couldn't exec %s\n", path);
+		return;
+	}
+
 	if (cmd_warncmd.value)
-		Con_Printf ("execing %s\n", Cmd_Argv (1));
+		Con_Printf ("execing %s\n", display_path);
 
 	Cbuf_InsertText ("\n"); // just in case there was no trailing \n.
 	Cbuf_InsertText (buf);
@@ -699,11 +733,21 @@ void Cmd_TokenizeString (const char *text)
 		if (!text)
 			return;
 
-		if (cmd_argc < MAX_ARGS)
-		{
-			strcpy (cmd_argv[cmd_argc], com_token);
-			cmd_argc++;
-		}
+		Cmd_AddArg (com_token);
+	}
+}
+
+/*
+============
+Cmd_AddArg
+============
+*/
+void Cmd_AddArg (const char *arg)
+{
+	if (cmd_argc < MAX_ARGS)
+	{
+		q_strlcpy (cmd_argv[cmd_argc], arg, sizeof (cmd_argv[cmd_argc]));
+		cmd_argc++;
 	}
 }
 
@@ -714,7 +758,7 @@ Cmd_AddCommand
 spike -- added an extra arg for client (also renamed and made a macro)
 ============
 */
-cmd_function_t *Cmd_AddCommand2 (const char *cmd_name, xcommand_t function, cmd_source_t srctype)
+cmd_function_t *Cmd_AddCommand2 (const char *cmd_name, xcommand_t function, cmd_source_t srctype, qboolean qcinterceptable)
 {
 	cmd_function_t *cmd;
 	cmd_function_t *cursor, *prev; // johnfitz -- sorted list insert
@@ -751,6 +795,7 @@ cmd_function_t *Cmd_AddCommand2 (const char *cmd_name, xcommand_t function, cmd_
 	}
 	cmd->function = function;
 	cmd->srctype = srctype;
+	cmd->qcinterceptable = qcinterceptable;
 
 	// johnfitz -- insert each entry in alphabetical order
 	if (cmd_functions == NULL || strcmp (cmd->name, cmd_functions->name) < 0) // insert at front
@@ -772,9 +817,7 @@ cmd_function_t *Cmd_AddCommand2 (const char *cmd_name, xcommand_t function, cmd_
 	}
 	// johnfitz
 
-	if (cmd->dynamic)
-		return cmd;
-	return NULL;
+	return cmd;
 }
 void Cmd_RemoveCommand (cmd_function_t *cmd)
 {
@@ -789,6 +832,34 @@ void Cmd_RemoveCommand (cmd_function_t *cmd)
 		}
 	}
 	Sys_Error ("Cmd_RemoveCommand unable to remove command %s", cmd->name);
+}
+
+/*
+============
+Cmd_FindCommand
+============
+*/
+cmd_function_t *Cmd_FindCommand (const char *cmd_name)
+{
+	cmd_function_t *cmd;
+
+	for (cmd = cmd_functions; cmd; cmd = cmd->next)
+		if (!q_strcasecmp (cmd_name, cmd->name))
+			return cmd;
+
+	return NULL;
+}
+
+/*
+============
+Cmd_IsReservedName
+
+Returns true if name starts with 2 underscores
+============
+*/
+qboolean Cmd_IsReservedName (const char *name)
+{
+	return name[0] == '_' && name[1] == '_';
 }
 
 /*

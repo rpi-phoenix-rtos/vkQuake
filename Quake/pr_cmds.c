@@ -32,8 +32,6 @@ char *PR_GetTempString (void)
 	return pr_string_temp[(STRINGTEMP_BUFFERS - 1) & ++pr_string_tempindex];
 }
 
-#define RETURN_EDICT(e) (((int *)qcvm->globals)[OFS_RETURN] = EDICT_TO_PROG (e))
-
 /*
 ===============================================================================
 
@@ -716,6 +714,7 @@ static void PF_traceline (void)
 	VectorCopy (trace.endpos, pr_global_struct->trace_endpos);
 	VectorCopy (trace.plane.normal, pr_global_struct->trace_plane_normal);
 	pr_global_struct->trace_plane_dist = trace.plane.dist;
+
 	if (trace.ent)
 		pr_global_struct->trace_ent = EDICT_TO_PROG (trace.ent);
 	else
@@ -1289,7 +1288,9 @@ static void PF_droptofloor (void)
 		VectorCopy (trace.endpos, ent->v.origin);
 		SV_LinkEdict (ent, false);
 		ent->v.flags = (int)ent->v.flags | FL_ONGROUND;
-		ent->v.groundentity = EDICT_TO_PROG (trace.ent);
+
+		if (trace.ent)
+			ent->v.groundentity = EDICT_TO_PROG (trace.ent);
 		G_FLOAT (OFS_RETURN) = 1;
 	}
 }
@@ -1831,6 +1832,7 @@ static void PF_cl_makestatic (void)
 
 	stat = cl.static_entities[i];
 	cl.num_statics++;
+	stat->is_static = true;
 
 	SV_BuildEntityState (ent, &stat->baseline);
 
@@ -1842,8 +1844,8 @@ static void PF_cl_makestatic (void)
 	stat->trailstate = NULL;
 	stat->emitstate = NULL;
 	stat->model = cl.model_precache[stat->baseline.modelindex];
-	stat->lerpflags |= LERP_RESETANIM; // johnfitz -- lerping
 	stat->frame = stat->baseline.frame;
+	stat->lerp.prev_frame = stat->frame; // johnfitz -- lerping
 
 	stat->skinnum = stat->baseline.skin;
 	stat->effects = stat->baseline.effects;

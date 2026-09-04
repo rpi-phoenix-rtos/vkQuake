@@ -25,6 +25,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 // server.h
 
+#define SERVER_INFO_STRING_SIZE 8192
+
 typedef struct
 {
 	int				 maxclients;
@@ -32,6 +34,8 @@ typedef struct
 	struct client_s *clients;			 // [maxclients]
 	int				 serverflags;		 // episode completion information
 	qboolean		 changelevel_issued; // cleared when at SV_SpawnServer
+
+	char serverinfo[SERVER_INFO_STRING_SIZE]; // \key\value infostring data.
 } server_static_t;
 
 //=============================================================================
@@ -106,6 +110,21 @@ typedef struct
 	size_t numcustomstats;
 
 	int effectsmask; // only enable colored quad/penta dlights in 2021 release
+
+	struct
+	{
+		qboolean active;
+		int		 numwarnings;
+
+		const char *changelevel;
+		int			trigger_changelevel;
+		int			valid_changelevel;
+		int			intermission;
+		int			skill_triggers;
+		int			coop_spawns;
+		int			dm_spawns;
+		int			skill_ents[3];
+	} mapchecks; // additional map checks for level designers
 } server_t;
 
 #define NUM_PING_TIMES		  16
@@ -211,6 +230,8 @@ typedef struct client_s
 	int		 lastmovemessage;
 	double	 lastmovetime;
 	qboolean knowntoqc; // putclientinserver was called
+
+	char userinfo[SERVER_INFO_STRING_SIZE]; // spike -- for csqc to (ab)use.
 } client_t;
 
 //=============================================================================

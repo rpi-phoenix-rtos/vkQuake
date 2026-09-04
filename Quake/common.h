@@ -20,8 +20,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 */
 
-#ifndef _Q_COMMON_H
-#define _Q_COMMON_H
+#ifndef Q_COMMON_H
+#define Q_COMMON_H
 
 // comndef.h  -- general definitions
 
@@ -252,16 +252,33 @@ int q_strncasecmp (const char *s1, const char *s2, size_t n);
 /* locale-insensitive case-insensitive alternative to strstr */
 char *q_strcasestr (const char *haystack, const char *needle);
 
+/* copies in to out, highlighting all occurrences of substr using the colored charset */
+char *COM_TintSubstring (const char *in, const char *substr, char *out, size_t outsize);
+
 /* locale-insensitive strlwr/upr replacement functions: */
 char *q_strlwr (char *str);
 char *q_strupr (char *str);
+
+/* writes the UTF-8 encoding of the code point; returns bytes written (up to 4) or 0 on error */
+size_t UTF8_WriteCodePoint (char *dst, size_t maxbytes, uint32_t codepoint);
+
+/* returns the number of bytes needed to encode the code point using UTF-8 (max 4), or 0 for an invalid code point */
+size_t UTF8_CodePointLength (uint32_t codepoint);
+
+/* converts a string from Quake encoding to UTF-8; returns the number of written characters (including the NUL terminator)
+if a valid output buffer is provided, or the total amount of space necessary if dst is NULL and maxbytes is 0 */
+size_t UTF8_FromQuake (char *dst, size_t maxbytes, const char *src);
 
 /* Trim whitespace on both ends, modifying str on-place: Returns the new start of str after trim */
 char *q_strtrim (char *str);
 
 /* Split str around any of the characters of sep_set, gobbling any number of consecutive found separators, modifying str in-place.
-The returned char** subs is the array of resulting sub-strings: subs[k] for k in 0 ..  nb_substr - 1.
-The returned char** is allocated by Mem_Alloc */
+In addition, if nb_substr != NULL:
+  The returned char** subs is the array of the nb_substr splitted sub-strings of str: subs[k] for k in [0 .. nb_substr [.
+else if nb_substr == NULL:
+   q_strsplit returns NULL.
+The returned char** subs array is allocated by Mem_Alloc.
+*/
 char **q_strsplit (char *str, const char *sep_set, size_t *nb_substr);
 
 // strdup that calls Mem_Alloc
@@ -296,6 +313,19 @@ typedef enum
 const char *COM_Parse (const char *data);
 const char *COM_ParseEx (const char *data, cpe_mode mode);
 
+typedef struct
+{
+	const char *data;
+	size_t		len;
+} stringview_t;
+
+qboolean COM_ParseLine (const char **str, stringview_t *line);
+qboolean COM_ParseMutableLine (char **str, char **line);
+
+int	 COM_WordLength (const char *text);
+int	 COM_AdvanceLineWrapped (const char **text, int maxchars);
+void COM_WordWrap (char *dst, const char *src, size_t dstsize, int maxcols);
+
 extern int	  com_argc;
 extern char **com_argv;
 
@@ -311,8 +341,17 @@ int COM_CheckParm (const char *parm);
 void COM_Init (void);
 void COM_InitArgv (int argc, char **argv);
 void COM_InitFilesystem (void);
+void COM_WriteSelectedBaseDir (void);
+
+const char *COM_GetWriteRoot (void);
+qboolean	COM_GetLegacySaveDir (char *dst, size_t dstsize);
+
+// opens a file in the per-user preferences dir (%APPDATA%\vkQuake on Windows)
+FILE *COM_FOpenPrefFile (const char *filename, const char *mode);
+FILE *COM_FOpenConfigFile (qboolean global, const char *mode);
 
 const char *COM_SkipPath (const char *pathname);
+const char *COM_SkipSpace (const char *str);
 void		COM_StripExtension (const char *in, char *out, size_t outsize);
 void		COM_FileBase (const char *in, char *out, size_t outsize);
 void		COM_AddExtension (char *path, const char *extension, size_t len);
@@ -321,12 +360,12 @@ void COM_DefaultExtension (char *path, const char *extension, size_t len);
 #endif
 const char *COM_FileGetExtension (const char *in); /* doesn't return NULL */
 void		COM_ExtractExtension (const char *in, char *out, size_t outsize);
-void		COM_CreatePath (char *path);
 
 char *va (const char *format, ...) FUNC_PRINTF (1, 2);
 // does a varargs printf into a temp buffer
 
 unsigned COM_HashString (const char *str);
+unsigned COM_HashBlock (const void *data, size_t size);
 
 // localization support for 2021 rerelease version:
 void		LOC_Init (void);
@@ -379,19 +418,24 @@ extern searchpath_t *com_base_searchpaths;
 extern THREAD_LOCAL qfileofs_t com_filesize;
 struct cache_user_s;
 
+#define MAX_BASEDIRS 4
 extern char				com_basedir[MAX_OSPATH];
+extern char				com_basedirs[MAX_BASEDIRS][MAX_OSPATH]; // all content roots in mount order, write target (userdir) last
+extern int				com_numbasedirs;
 extern char				com_gamedir[MAX_OSPATH];
 extern THREAD_LOCAL int file_from_pak; // global indicating that file came from a pak
+
+void COM_AddBaseDir (const char *dir);
 
 const char *COM_GetGameNames (qboolean full);
 qboolean	COM_GameDirMatches (const char *tdirs);
 qboolean	COM_ModForbiddenChars (const char *p);
 
-void	 COM_WriteFile (const char *filename, const void *data, int len);
-int		 COM_OpenFile (const char *filename, int *handle, unsigned int *path_id);
-int		 COM_FOpenFile (const char *filename, FILE **file, unsigned int *path_id);
-qboolean COM_FileExists (const char *filename, unsigned int *path_id);
-void	 COM_CloseFile (int h);
+void		COM_WriteFile (const char *filename, const void *data, int len);
+qfilesize_t COM_OpenFile (const char *filename, int *handle, unsigned int *path_id);
+qfilesize_t COM_FOpenFile (const char *filename, FILE **file, unsigned int *path_id);
+qboolean	COM_FileExists (const char *filename, unsigned int *path_id);
+void		COM_CloseFile (int h);
 
 byte *COM_LoadFile (const char *path, unsigned int *path_id);
 
@@ -440,27 +484,27 @@ size_t COM_SanitizeDescriptionString (char *dst, size_t dstsize, const char *src
 
 typedef struct _fshandle_t
 {
-	FILE	*file;
-	qboolean pak;	 /* is the file read from a pak */
-	long	 start;	 /* file or data start position */
-	long	 length; /* file or data size */
-	long	 pos;	 /* current position relative to start */
+	FILE	   *file;
+	qboolean	pak;	/* is the file read from a pak */
+	qfileofs_t	start;	/* file or data start position */
+	qfilesize_t length; /* file or data size */
+	qfileofs_t	pos;	/* current position relative to start */
 } fshandle_t;
 
+// Only read 2**31 elements max, should be enough still
 size_t FS_fread (void *ptr, size_t size, size_t nmemb, fshandle_t *fh);
-int	   FS_fseek (fshandle_t *fh, long offset, int whence);
-long   FS_ftell (fshandle_t *fh);
-void   FS_rewind (fshandle_t *fh);
-int	   FS_feof (fshandle_t *fh);
-int	   FS_ferror (fshandle_t *fh);
-int	   FS_fclose (fshandle_t *fh);
-int	   FS_fgetc (fshandle_t *fh);
-char  *FS_fgets (char *s, int size, fshandle_t *fh);
-long   FS_filelength (fshandle_t *fh);
+
+int			FS_fseek (fshandle_t *fh, qfileofs_t offset, int whence);
+qfileofs_t	FS_ftell (fshandle_t *fh);
+void		FS_rewind (fshandle_t *fh);
+int			FS_feof (fshandle_t *fh);
+int			FS_ferror (fshandle_t *fh);
+int			FS_fclose (fshandle_t *fh);
+int			FS_fgetc (fshandle_t *fh);
+char	   *FS_fgets (char *s, int size, fshandle_t *fh);
+qfilesize_t FS_filelength (fshandle_t *fh);
 
 extern struct cvar_s registered;
-extern qboolean		 standard_quake, rogue, hipnotic;
-extern qboolean		 fitzmode;
-/* if true, run in fitzquake mode disabling custom quakespasm hacks */
+extern qboolean		 standard_quake, rogue, hipnotic, mg3;
 
-#endif /* _Q_COMMON_H */
+#endif /* Q_COMMON_H */

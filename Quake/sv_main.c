@@ -744,7 +744,7 @@ static void SVFTE_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, size_
 			if (entnum > 0x3fff)
 			{
 				MSG_WriteShort (msg, 0xc000 | (entnum & 0x3fff));
-				MSG_WriteByte (msg, entnum >> 14);
+				MSG_WriteByte (msg, (entnum >> 14) & 0xff);
 			}
 			else
 				MSG_WriteShort (msg, 0x8000 | entnum);
@@ -778,7 +778,7 @@ static void SVFTE_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, size_
 				if (entnum >= 0x4000)
 				{
 					MSG_WriteShort (msg, 0x4000 | (entnum & 0x3fff));
-					MSG_WriteByte (msg, entnum >> 14);
+					MSG_WriteByte (msg, (entnum >> 14) & 0xff);
 				}
 				else
 					MSG_WriteShort (msg, entnum);
@@ -869,11 +869,10 @@ void SV_BuildEntityState (edict_t *ent, entity_state_t *state)
 	state->velocity[0] = state->velocity[1] = state->velocity[2] = 0;
 
 #ifdef LERP_BANDAID
-	state->lerp = ent->sendinterval ? Q_rint ((ent->v.nextthink - qcvm->time) * 1000) + 1 : 0;
+	state->lerp = (ent->sendinterval || ent->sendinterval_default) ? Q_rint ((ent->v.nextthink - qcvm->time) * 1000) + 1 : 0;
 #endif
 }
 
-byte	   *SV_FatPVS (vec3_t org, qmodel_t *worldmodel);
 static void SVFTE_BuildSnapshotForClient (client_t *client)
 {
 	unsigned int  e, i;
@@ -992,9 +991,9 @@ void MSG_WriteStaticOrBaseLine (sizebuf_t *buf, int idx, entity_state_t *state, 
 		{
 			if (protocol == PROTOCOL_FITZQUAKE || protocol == PROTOCOL_RMQ) // still want to send baseline in PROTOCOL_NETQUAKE, so reset these values
 			{
-				if (state->modelindex & 0xFF00)
+				if (state->modelindex > 255)
 					bits |= B_LARGEMODEL;
-				if (state->frame & 0xFF00)
+				if (state->frame > 255)
 					bits |= B_LARGEFRAME;
 				if (state->alpha != ENTALPHA_DEFAULT)
 					bits |= B_ALPHA;
@@ -1143,6 +1142,7 @@ void SV_Init (void)
 	extern cvar_t sv_gameplayfix_bouncedownslopes;
 	extern cvar_t sv_gameplayfix_elevators;
 	extern cvar_t sv_fastpushmove;
+	extern cvar_t sv_analyticphysics;
 	extern cvar_t sv_friction;
 	extern cvar_t sv_edgefriction;
 	extern cvar_t sv_stopspeed;
@@ -1174,6 +1174,7 @@ void SV_Init (void)
 	Cvar_RegisterVariable (&sv_gameplayfix_bouncedownslopes);
 	Cvar_RegisterVariable (&sv_gameplayfix_elevators);
 	Cvar_RegisterVariable (&sv_fastpushmove);
+	Cvar_RegisterVariable (&sv_analyticphysics);
 	Cvar_RegisterVariable (&pr_checkextension);
 	Cvar_RegisterVariable (&sv_altnoclip); // johnfitz
 	Cvar_RegisterVariable (&sv_netsort);
@@ -1260,7 +1261,8 @@ weapon, feet, etc.
 
 Channel 0 is an auto-allocate channel, the others override anything
 allready running on that entity/channel pair.
-volume is in 0-255.
+Volume is in 0-255.
+Attenuation is in 0-4
 An attenuation of 0 will play full volume everywhere in the level.
 Larger attenuations will drop off.  (max 4 attenuation)
 
@@ -1890,6 +1892,22 @@ byte *SV_FatPVS (vec3_t org, qmodel_t *worldmodel) // johnfitz -- added worldmod
 
 /*
 =============
+SV_EdictInPVS
+=============
+*/
+qboolean SV_EdictInPVS (edict_t *test, byte *pvs)
+{
+	unsigned int i;
+
+	for (i = 0; i < test->num_leafs; i++)
+		if (pvs[test->leafnums[i] >> 3] & (1 << (test->leafnums[i] & 7)))
+			return true;
+
+	return false;
+}
+
+/*
+=============
 SV_VisibleToClient -- johnfitz
 
 PVS test encapsulated in a nice function
@@ -1897,18 +1915,13 @@ PVS test encapsulated in a nice function
 */
 qboolean SV_VisibleToClient (edict_t *client, edict_t *test, qmodel_t *worldmodel)
 {
-	byte		*pvs;
-	vec3_t		 org;
-	unsigned int i;
+	byte  *pvs;
+	vec3_t org;
 
 	VectorAdd (client->v.origin, client->v.view_ofs, org);
 	pvs = SV_FatPVS (org, worldmodel);
 
-	for (i = 0; i < test->num_leafs; i++)
-		if (pvs[test->leafnums[i] >> 3] & (1 << (test->leafnums[i] & 7)))
-			return true;
-
-	return false;
+	return SV_EdictInPVS (test, pvs);
 }
 
 //=============================================================================
@@ -2151,11 +2164,13 @@ void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, size_t overflow
 			}
 			else if (ENTSCALE_DEFAULT != scale) // for 666, we didn't send the scale in the baseline!
 				bits |= U_SCALE;
-			if (bits & U_FRAME && (int)ent->v.frame & 0xFF00)
+			if (bits & U_FRAME && (int)ent->v.frame > 255)
 				bits |= U_FRAME2;
-			if (bits & U_MODEL && (int)ent->v.modelindex & 0xFF00)
+			if (bits & U_MODEL && (int)ent->v.modelindex > 255)
 				bits |= U_MODEL2;
-			if (ent->sendinterval)
+			// nonstandard intervals are always sent; the default 0.1 the client assumes anyway is only worth
+			// the extra bytes on clients that are not constrained by the DATAGRAM_MTU packet budget
+			if (ent->sendinterval || (ent->sendinterval_default && client->limit_unreliable > DATAGRAM_MTU))
 				bits |= U_LERPFINISH;
 			if (bits >= 65536)
 				bits |= U_EXTEND1;
@@ -2173,16 +2188,16 @@ void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, size_t overflow
 		//
 		// write the message
 		//
-		MSG_WriteByte (msg, bits | U_SIGNAL);
+		MSG_WriteByte (msg, (bits | U_SIGNAL) & 0xff);
 
 		if (bits & U_MOREBITS)
-			MSG_WriteByte (msg, bits >> 8);
+			MSG_WriteByte (msg, (bits >> 8) & 0xff);
 
 		// johnfitz -- PROTOCOL_FITZQUAKE
 		if (bits & U_EXTEND1)
-			MSG_WriteByte (msg, bits >> 16);
+			MSG_WriteByte (msg, (bits >> 16) & 0xff);
 		if (bits & U_EXTEND2)
-			MSG_WriteByte (msg, bits >> 24);
+			MSG_WriteByte (msg, (bits >> 24) & 0xff);
 		// johnfitz
 
 		if (bits & U_LONGENTITY)
@@ -2191,9 +2206,9 @@ void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, size_t overflow
 			MSG_WriteByte (msg, e);
 
 		if (bits & U_MODEL)
-			MSG_WriteByte (msg, ent->v.modelindex);
+			MSG_WriteByte (msg, (int)ent->v.modelindex & 0xff);
 		if (bits & U_FRAME)
-			MSG_WriteByte (msg, ent->v.frame);
+			MSG_WriteByte (msg, (int)ent->v.frame & 0xff);
 		if (bits & U_COLORMAP)
 			MSG_WriteByte (msg, ent->v.colormap);
 		if (bits & U_SKIN)
@@ -2223,7 +2238,7 @@ void SV_WriteEntitiesToClient (client_t *client, sizebuf_t *msg, size_t overflow
 		if (bits & U_MODEL2)
 			MSG_WriteByte (msg, (int)ent->v.modelindex >> 8);
 		if (bits & U_LERPFINISH)
-			MSG_WriteByte (msg, (byte)(Q_rint ((ent->v.nextthink - qcvm->time) * 255)));
+			MSG_WriteByte (msg, (byte)CLAMP (0, Q_rint ((ent->v.nextthink - qcvm->time) * 255), 255)); // qcvm->time may have advanced past nextthink
 		// johnfitz
 
 		if ((size_t)msg->cursize > origmaxsize)
@@ -2380,21 +2395,21 @@ void SV_WriteClientdataToMessage (client_t *client, sizebuf_t *msg)
 	// johnfitz -- PROTOCOL_FITZQUAKE
 	if (sv.protocol != PROTOCOL_NETQUAKE)
 	{
-		if (bits & SU_WEAPON && weaponmodelindex & 0xFF00)
+		if (bits & SU_WEAPON && weaponmodelindex > 255)
 			bits |= SU_WEAPON2;
-		if ((int)ent->v.armorvalue & 0xFF00)
+		if ((int)ent->v.armorvalue > 255)
 			bits |= SU_ARMOR2;
-		if ((int)ent->v.currentammo & 0xFF00)
+		if ((int)ent->v.currentammo > 255)
 			bits |= SU_AMMO2;
-		if ((int)ent->v.ammo_shells & 0xFF00)
+		if ((int)ent->v.ammo_shells > 255)
 			bits |= SU_SHELLS2;
-		if ((int)ent->v.ammo_nails & 0xFF00)
+		if ((int)ent->v.ammo_nails > 255)
 			bits |= SU_NAILS2;
-		if ((int)ent->v.ammo_rockets & 0xFF00)
+		if ((int)ent->v.ammo_rockets > 255)
 			bits |= SU_ROCKETS2;
-		if ((int)ent->v.ammo_cells & 0xFF00)
+		if ((int)ent->v.ammo_cells > 255)
 			bits |= SU_CELLS2;
-		if (bits & SU_WEAPONFRAME && (int)ent->v.weaponframe & 0xFF00)
+		if (bits & SU_WEAPONFRAME && (int)ent->v.weaponframe > 255)
 			bits |= SU_WEAPONFRAME2;
 		if (bits & SU_WEAPON && ent->alpha != ENTALPHA_DEFAULT)
 			bits |= SU_WEAPONALPHA; // for now, weaponalpha = client entity alpha
@@ -2435,22 +2450,22 @@ void SV_WriteClientdataToMessage (client_t *client, sizebuf_t *msg)
 	MSG_WriteLong (msg, items);
 
 	if (bits & SU_WEAPONFRAME)
-		MSG_WriteByte (msg, ent->v.weaponframe);
+		MSG_WriteByte (msg, (int)ent->v.weaponframe & 0xff);
 	if (bits & SU_ARMOR)
-		MSG_WriteByte (msg, ent->v.armorvalue);
+		MSG_WriteByte (msg, (int)ent->v.armorvalue & 0xff);
 	if (bits & SU_WEAPON)
-		MSG_WriteByte (msg, weaponmodelindex);
+		MSG_WriteByte (msg, (int)weaponmodelindex & 0xff);
 
 	MSG_WriteShort (msg, ent->v.health);
-	MSG_WriteByte (msg, ent->v.currentammo);
-	MSG_WriteByte (msg, ent->v.ammo_shells);
-	MSG_WriteByte (msg, ent->v.ammo_nails);
-	MSG_WriteByte (msg, ent->v.ammo_rockets);
-	MSG_WriteByte (msg, ent->v.ammo_cells);
+	MSG_WriteByte (msg, (int)ent->v.currentammo & 0xff);
+	MSG_WriteByte (msg, (int)ent->v.ammo_shells & 0xff);
+	MSG_WriteByte (msg, (int)ent->v.ammo_nails & 0xff);
+	MSG_WriteByte (msg, (int)ent->v.ammo_rockets & 0xff);
+	MSG_WriteByte (msg, (int)ent->v.ammo_cells & 0xff);
 
 	if (standard_quake)
 	{
-		MSG_WriteByte (msg, ent->v.weapon);
+		MSG_WriteByte (msg, (int)ent->v.weapon & 0xff);
 	}
 	else
 	{
@@ -3119,6 +3134,158 @@ void SV_SaveSpawnparms (void)
 	}
 }
 
+typedef enum
+{
+	MAPCHECK_FAILED,
+	MAPCHECK_PARTIAL,
+	MAPCHECK_OK,
+} mapcheck_t;
+
+/*
+================
+SV_MapCheckThresh
+================
+*/
+static mapcheck_t SV_MapCheckThresh (int current, int target)
+{
+	if (current <= 0)
+		return MAPCHECK_FAILED;
+	if (current >= target)
+		return MAPCHECK_OK;
+	return MAPCHECK_PARTIAL;
+}
+
+/*
+================
+SV_PrintMapCheck
+================
+*/
+static void SV_PrintMapCheck (mapcheck_t status, const char *format, ...)
+{
+	char	str[1024];
+	va_list argptr;
+
+	va_start (argptr, format);
+	q_vsnprintf (str, sizeof (str), format, argptr);
+	va_end (argptr);
+
+	if (status == MAPCHECK_OK)
+		Con_SafePrintf ("[x] %s\n", str);
+	else
+	{
+		Con_SafePrintf ("[%c] %s\n", status == MAPCHECK_PARTIAL ? '-' : ' ', str);
+		sv.mapchecks.numwarnings++;
+	}
+}
+
+/*
+================
+SV_PrintMapChecklist
+================
+*/
+static void SV_PrintMapChecklist (void)
+{
+	const int MIN_DM_SPAWN_POINTS = 5;
+	const int MIN_COOP_SPAWN_POINTS = 3;
+
+	qboolean skill_levels;
+	char	 buf[1024];
+	int		 i, track, numskies, count;
+
+	Con_SafePrintf ("\n");
+	Con_SafePrintf ("=====================================\n");
+	Con_SafePrintf ("\n");
+	Con_SafePrintf ("Map checklist (%s):\n\n", COM_SkipPath (sv.modelname));
+
+	SV_PrintMapCheck (qcvm->worldmodel->lightdata != NULL ? MAPCHECK_OK : MAPCHECK_FAILED, "lightmap data");
+
+	if (!qcvm->worldmodel->visdata)
+	{
+		char pointfile[MAX_OSPATH];
+		q_snprintf (pointfile, sizeof (pointfile), "maps/%s.pts", sv.name);
+		if (COM_FileExists (pointfile, NULL))
+			SV_PrintMapCheck (MAPCHECK_FAILED, "vis data (unsealed map?)");
+		else
+			SV_PrintMapCheck (MAPCHECK_FAILED, "vis data");
+	}
+	else
+		SV_PrintMapCheck (MAPCHECK_OK, "vis data");
+
+	if (!sv.mapchecks.trigger_changelevel)
+		SV_PrintMapCheck (MAPCHECK_FAILED, "trigger_changelevel");
+	else if (sv.mapchecks.trigger_changelevel == 1)
+	{
+		if (sv.mapchecks.valid_changelevel == sv.mapchecks.trigger_changelevel)
+			SV_PrintMapCheck (MAPCHECK_OK, "trigger_changelevel (%s)", sv.mapchecks.changelevel);
+		else
+			SV_PrintMapCheck (MAPCHECK_PARTIAL, "trigger_changelevel (missing \"map\" key)");
+	}
+	else
+	{
+		if (sv.mapchecks.valid_changelevel == sv.mapchecks.trigger_changelevel)
+			SV_PrintMapCheck (MAPCHECK_OK, "trigger_changelevel (%d)", sv.mapchecks.trigger_changelevel);
+		else
+			SV_PrintMapCheck (
+				MAPCHECK_PARTIAL, "trigger_changelevel (%d/%d missing \"map\" key)", sv.mapchecks.trigger_changelevel - sv.mapchecks.valid_changelevel,
+				sv.mapchecks.trigger_changelevel);
+	}
+
+	if (!sv.mapchecks.intermission)
+		SV_PrintMapCheck (MAPCHECK_FAILED, "info_intermission");
+	else
+		SV_PrintMapCheck (MAPCHECK_OK, "info_intermission (%d)", sv.mapchecks.intermission);
+
+	skill_levels = sv.mapchecks.skill_triggers > 0 ||
+				   (sv.mapchecks.skill_ents[0] != sv.mapchecks.skill_ents[1] || sv.mapchecks.skill_ents[1] != sv.mapchecks.skill_ents[2]);
+	SV_PrintMapCheck (skill_levels ? MAPCHECK_OK : MAPCHECK_FAILED, "skill spawnflags/triggers");
+
+	SV_PrintMapCheck (
+		SV_MapCheckThresh (sv.mapchecks.coop_spawns, MIN_COOP_SPAWN_POINTS), "info_player_coop (%d/%d+)", sv.mapchecks.coop_spawns, MIN_COOP_SPAWN_POINTS);
+
+	SV_PrintMapCheck (
+		SV_MapCheckThresh (sv.mapchecks.dm_spawns, MIN_DM_SPAWN_POINTS), "info_player_deathmatch (%d/%d+)", sv.mapchecks.dm_spawns, MIN_DM_SPAWN_POINTS);
+
+	track = (int)qcvm->edicts->v.sounds;
+	if (track == 0)
+		SV_PrintMapCheck (MAPCHECK_FAILED, "music track (worldspawn \"sounds\" field)");
+	else if (track < 2 || track > 255)
+		SV_PrintMapCheck (MAPCHECK_FAILED, "music track (%d, should be between 2 and 255)", track);
+	else
+		SV_PrintMapCheck (MAPCHECK_OK, "music track (%d)", track);
+
+	Mod_SanitizeMapDescription (buf, sizeof (buf), PR_GetString ((int)qcvm->edicts->v.message));
+	if (buf[0])
+		SV_PrintMapCheck (MAPCHECK_OK, "map title (%s)", buf);
+	else
+		SV_PrintMapCheck (MAPCHECK_FAILED, "map title (worldspawn \"message\" field)");
+
+	numskies = qcvm->worldmodel->texofs[TEXTYPE_SKY + 1] - qcvm->worldmodel->texofs[TEXTYPE_SKY];
+	count = 0;
+	for (i = 0; i < numskies; i++)
+	{
+		texture_t *tex = qcvm->worldmodel->textures[qcvm->worldmodel->usedtextures[qcvm->worldmodel->texofs[TEXTYPE_SKY] + i]];
+		if (tex->width != 256 || tex->height != 128)
+			count++;
+	}
+	if (numskies > 1 || count > 0)
+	{
+		SV_PrintMapCheck (MAPCHECK_FAILED, "compat: single %ssky texture (%d found)", count > 0 ? "256 x 128 " : "", numskies);
+		for (i = 0; i < numskies; i++)
+		{
+			texture_t *tex = qcvm->worldmodel->textures[qcvm->worldmodel->usedtextures[qcvm->worldmodel->texofs[TEXTYPE_SKY] + i]];
+			if (tex->width != 256 || tex->height != 128)
+				q_snprintf (buf, sizeof (buf), " (%d x %d)", tex->width, tex->height);
+			else
+				buf[0] = '\0';
+			Con_SafePrintf ("\x02    %d. %s%s\n", i + 1, tex->name, buf);
+		}
+	}
+
+	Con_SafePrintf ("\n");
+	Con_SafePrintf ("=====================================\n");
+	Con_SafePrintf ("\n");
+}
+
 // used for sv.qcvm.GetModel (so ssqc+csqc can share builtins)
 qmodel_t *SV_ModelForIndex (int index)
 {
@@ -3177,6 +3344,8 @@ void SV_SpawnServer (const char *server)
 	Host_ClearMemory ();
 
 	q_strlcpy (sv.name, server, sizeof (sv.name));
+	if (developer.value || map_checks.value)
+		sv.mapchecks.active = true;
 
 	sv.protocol = sv_protocol; // johnfitz
 
@@ -3332,4 +3501,7 @@ void SV_SpawnServer (const char *server)
 	}
 
 	Con_DPrintf ("Server spawned.\n");
+
+	if (sv.mapchecks.active)
+		SV_PrintMapChecklist ();
 }

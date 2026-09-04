@@ -24,6 +24,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 #include "bgmusic.h"
+#include "steam.h"
 #include "tasks.h"
 #include <setjmp.h>
 #ifdef _DEBUG
@@ -46,8 +47,9 @@ quakeparms_t *host_parms;
 qboolean host_initialized; // true if into command execution
 
 double host_frametime;
-double realtime;	// without any filtering or bounding
-double oldrealtime; // last frame run
+double host_rawframetime; // unscaled and unbounded
+double realtime;		  // without any filtering or bounding
+double oldrealtime;		  // last frame run
 
 int host_framecount;
 
@@ -62,6 +64,7 @@ byte  *host_colormap;
 float  host_netinterval = 1.0 / HOST_NETITERVAL_FREQ;
 cvar_t host_framerate = {"host_framerate", "0", CVAR_NONE}; // set for slow motion
 cvar_t host_speeds = {"host_speeds", "0", CVAR_NONE};		// set for running times
+cvar_t sv_speeds = {"sv_speeds", "0", CVAR_NONE};			// print per-tick server cost, split by section
 cvar_t host_maxfps = {"host_maxfps", "200", CVAR_ARCHIVE};	// johnfitz
 
 cvar_t host_phys_max_ticrate = {"host_phys_max_ticrate", "0", CVAR_NONE}; // vso = [0 = disabled; MAX_PHYSICS_FREQ]
@@ -84,10 +87,11 @@ cvar_t coop = {"coop", "0", CVAR_NONE};				// 0 or 1
 
 cvar_t pausable = {"pausable", "1", CVAR_NONE};
 
-cvar_t autoload = {"autoload", "1", CVAR_ARCHIVE};
-cvar_t autofastload = {"autofastload", "0", CVAR_ARCHIVE};
+cvar_t autoload = {"autoload", "1", CVAR_ARCHIVE_GAME};
+cvar_t autofastload = {"autofastload", "0", CVAR_ARCHIVE_GAME};
 
 cvar_t developer = {"developer", "0", CVAR_NONE};
+cvar_t map_checks = {"map_checks", "0", CVAR_NONE};
 
 static cvar_t pr_engine = {"pr_engine", ENGINE_NAME_AND_VER, CVAR_NONE};
 cvar_t		  temp1 = {"temp1", "0", CVAR_NONE};
@@ -357,6 +361,7 @@ void Host_InitLocal (void)
 	Cvar_RegisterVariable (&pr_engine);
 	Cvar_RegisterVariable (&host_framerate);
 	Cvar_RegisterVariable (&host_speeds);
+	Cvar_RegisterVariable (&sv_speeds);
 	Cvar_RegisterVariable (&host_maxfps); // johnfitz
 	Cvar_SetCallback (&host_maxfps, Max_Fps_f);
 	Cvar_RegisterVariable (&host_phys_max_ticrate); // vso
@@ -382,6 +387,7 @@ void Host_InitLocal (void)
 	Cvar_SetCallback (&noexit, Host_Callback_Notify);
 	Cvar_RegisterVariable (&skill);
 	Cvar_RegisterVariable (&developer);
+	Cvar_RegisterVariable (&map_checks);
 	Cvar_RegisterVariable (&coop);
 	Cvar_RegisterVariable (&deathmatch);
 
@@ -403,41 +409,40 @@ void Host_InitLocal (void)
 ===============
 Host_WriteConfiguration
 
-Writes key bindings and archived cvars to config.cfg
+Writes archived cvars to the global config and game-local state to the
+current game config.
 ===============
 */
 void Host_WriteConfiguration (void)
 {
-	FILE *f = NULL;
+	FILE *f;
 
-	// dedicated servers initialize the host but don't parse and set the
-	// config.cfg cvars
+	// dedicated servers initialize the host but don't parse and set the config cvars
 	if (host_initialized && !isDedicated && !host_parms->errstate)
 	{
-		if (multiuser)
-		{
-			char *pref_path = SDL_GetPrefPath ("", "vkQuake");
-			f = fopen (va ("%s/config.cfg", pref_path), "w");
-			SDL_free (pref_path);
-		}
-		else
-			f = fopen (va ("%s/" CONFIG_NAME, com_gamedir), "w");
+		f = COM_FOpenConfigFile (true, "w");
 		if (!f)
 		{
-			Con_Printf ("Couldn't write " CONFIG_NAME ".\n");
+			Con_Printf ("Couldn't write global " CONFIG_NAME ".\n");
 			return;
 		}
 
 		// VID_SyncCvars (); //johnfitz -- write actual current mode to config file, in case cvars were messed with
 
-		Key_WriteBindings (f);
-		Cvar_WriteVariables (f);
-
-		// johnfitz -- extra commands to preserve state
+		Cvar_WriteVariables (f, CVAR_ARCHIVE);
 		fprintf (f, "vid_restart\n");
-		fprintf (f, "+mlook\n"); // always enable mouse look on config, can be overriden by -mlook in autoexec.cfg
-		// johnfitz
+		fclose (f);
 
+		f = COM_FOpenConfigFile (false, "w");
+		if (!f)
+		{
+			Con_Printf ("Couldn't write game " CONFIG_NAME ".\n");
+			return;
+		}
+
+		Key_WriteBindings (f);
+		Cvar_WriteVariables (f, CVAR_ARCHIVE_GAME);
+		fprintf (f, "+mlook\n"); // always enable mouse look on config, can be overriden by -mlook in autoexec.cfg
 		fclose (f);
 	}
 }
@@ -726,7 +731,7 @@ qboolean Host_FilterTime (float time)
 						  // johnfitz
 	}
 
-	host_frametime = delta_since_last_frame;
+	host_frametime = host_rawframetime = delta_since_last_frame;
 	oldrealtime = realtime;
 
 	if (cls.demoplayback && cls.demospeed != 1.f && cls.demospeed > 0.f)
@@ -773,8 +778,14 @@ Host_ServerFrame
 */
 void Host_ServerFrame (void)
 {
-	int		 i, active; // johnfitz
-	edict_t *ent;		// johnfitz
+	int			  i, active; // johnfitz
+	edict_t		 *ent;		 // johnfitz
+	double		  t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+	static double clients_ms, physics_ms, stats_ms, send_ms, interval_start;
+	static int	  ticks;
+
+	if (sv_speeds.value)
+		t0 = Sys_DoubleTime ();
 
 	// run the world state
 	pr_global_struct->frametime = host_frametime;
@@ -788,13 +799,20 @@ void Host_ServerFrame (void)
 	// read client messages
 	SV_RunClients ();
 
+	if (sv_speeds.value)
+		t1 = Sys_DoubleTime ();
+
 	// move things around and think
 	// always pause in single player if in console or menus
 	if (!sv.paused && (svs.maxclients > 1 || key_dest == key_game))
 		SV_Physics ();
 
+	if (sv_speeds.value)
+		t2 = Sys_DoubleTime ();
+
 	// johnfitz -- devstats
-	if (cls.signon == SIGNONS)
+	// the count is only observable through the devstats overlay and a developer warning, so don't walk every edict per tick unless one of them can see it
+	if (cls.signon == SIGNONS && (devstats.value || developer.value))
 	{
 		for (i = 0, active = 0; i < qcvm->num_edicts; i++)
 		{
@@ -809,8 +827,54 @@ void Host_ServerFrame (void)
 	}
 	// johnfitz
 
+	if (sv_speeds.value)
+		t3 = Sys_DoubleTime ();
+
 	// send all messages to the clients
 	SV_SendClientMessages ();
+
+	extern double sv_speeds_think_ms, sv_speeds_pusher_ms, sv_speeds_build_ms;
+	extern int	  sv_speeds_thinks, sv_speeds_pushers, sv_speeds_pushables, sv_speeds_grid_entries;
+
+	if (!sv_speeds.value && interval_start != 0)
+	{
+		// reset on toggle so a later enable doesn't average across the gap
+		clients_ms = physics_ms = stats_ms = send_ms = 0;
+		sv_speeds_think_ms = sv_speeds_pusher_ms = sv_speeds_build_ms = 0;
+		sv_speeds_thinks = sv_speeds_pushers = sv_speeds_pushables = sv_speeds_grid_entries = 0;
+		ticks = 0;
+		interval_start = 0;
+	}
+
+	if (sv_speeds.value)
+	{
+		t4 = Sys_DoubleTime ();
+		clients_ms += (t1 - t0) * 1000.0;
+		physics_ms += (t2 - t1) * 1000.0;
+		stats_ms += (t3 - t2) * 1000.0;
+		send_ms += (t4 - t3) * 1000.0;
+		ticks++;
+		if (interval_start == 0)
+			interval_start = t0;
+		if (t4 - interval_start >= 1.0)
+		{
+			double physics = physics_ms / ticks;
+			double pushers = sv_speeds_pusher_ms / ticks;
+			double thinks = sv_speeds_think_ms / ticks;
+			double build = sv_speeds_build_ms / ticks;
+			Con_Printf (
+				"sv_speeds: %3d ticks | clients %.3f | physics %.3f [pushers %.3f (%.0f) thinks %.3f (%.0f) build %.3f loop %.3f] | stats %.3f | send %.3f "
+				"ms/tick | %d edicts, %.0f pushables, %.0f grid entries\n",
+				ticks, clients_ms / ticks, physics, pushers, (double)sv_speeds_pushers / ticks, thinks, (double)sv_speeds_thinks / ticks, build,
+				physics - pushers - thinks - build, stats_ms / ticks, send_ms / ticks, qcvm->num_edicts, (double)sv_speeds_pushables / ticks,
+				(double)sv_speeds_grid_entries / ticks);
+			clients_ms = physics_ms = stats_ms = send_ms = 0;
+			sv_speeds_think_ms = sv_speeds_pusher_ms = sv_speeds_build_ms = 0;
+			sv_speeds_thinks = sv_speeds_pushers = sv_speeds_pushables = sv_speeds_grid_entries = 0;
+			ticks = 0;
+			interval_start = t4;
+		}
+	}
 }
 
 static void CL_LoadCSProgs (void)
@@ -893,6 +957,62 @@ static void CL_LoadCSProgs (void)
 
 /*
 ==================
+Host_UpdateSteamStatus
+
+Updates the Steam rich presence status when the map or
+player counts change (based on the Ironwail equivalent)
+==================
+*/
+static void Host_UpdateSteamStatus (void)
+{
+	static double nextupdate = 0.0;
+	static char	  lastmap[sizeof (cl.levelname)];
+	static int	  lastplayers = -1, lastmaxplayers = -1;
+	char		  mapname[sizeof (cl.levelname)];
+	int			  players = 0, maxplayers = 0, i;
+
+	if (realtime < nextupdate)
+		return;
+	nextupdate = realtime + 0.25;
+
+	mapname[0] = '\0';
+	if (cls.state == ca_connected && cl.worldmodel)
+	{
+		// strip Quake color codes and control characters from the level name
+		const char *src = cl.levelname;
+		size_t		len = 0;
+		while (*src && len < sizeof (mapname) - 1)
+		{
+			char c = *src++ & 0x7f;
+			if (c >= 32)
+				mapname[len++] = c;
+		}
+		mapname[len] = '\0';
+		if (!mapname[0])
+			COM_StripExtension (COM_SkipPath (cl.worldmodel->name), mapname, sizeof (mapname));
+
+		maxplayers = cl.maxclients;
+		for (i = 0; i < cl.maxclients; i++)
+			if (cl.scores[i].name[0])
+				players++;
+	}
+
+	if (!strcmp (mapname, lastmap) && players == lastplayers && maxplayers == lastmaxplayers)
+		return;
+	q_strlcpy (lastmap, mapname, sizeof (lastmap));
+	lastplayers = players;
+	lastmaxplayers = maxplayers;
+
+	if (!mapname[0])
+		Steam_SetStatus_Menu ();
+	else if (maxplayers > 1)
+		Steam_SetStatus_Multiplayer (players, maxplayers, mapname);
+	else
+		Steam_SetStatus_SinglePlayer (mapname);
+}
+
+/*
+==================
 Host_Frame
 
 Runs all active servers
@@ -929,6 +1049,9 @@ static void _Host_Frame (double time)
 
 		// allow mice or other external controllers to add commands
 		IN_Commands ();
+
+		// handle mouse interaction with the console (selection, links)
+		Con_UpdateMouseState ();
 	}
 
 	// check the stdin for commands (dedicated servers)
@@ -936,6 +1059,8 @@ static void _Host_Frame (double time)
 
 	// process console commands
 	Cbuf_Execute ();
+	if (host_framecount == 0)
+		SCR_EndStartupLoadingPlaque ();
 
 	NET_Poll ();
 
@@ -966,7 +1091,7 @@ static void _Host_Frame (double time)
 				}
 				else
 				{
-					host_frametime = q_max (accumtime, host_netinterval);
+					host_frametime = host_netinterval;
 				}
 			}
 			else
@@ -1029,6 +1154,8 @@ static void _Host_Frame (double time)
 		S_Update (vec3_origin, vec3_origin, vec3_origin, vec3_origin);
 
 	CDAudio_Update ();
+
+	Host_UpdateSteamStatus ();
 
 	if (host_speeds.value)
 	{
@@ -1140,8 +1267,9 @@ void Host_Init (void)
 		Chase_Init ();
 		M_Init ();
 		ExtraMaps_Init (); // johnfitz
-		Modlist_Init ();   // johnfitz
-		DemoList_Init ();  // ericw
+		M_CheckMods ();
+		Modlist_Init ();  // johnfitz
+		DemoList_Init (); // ericw
 		SaveList_Init ();
 		VID_Init ();
 		IN_Init ();
@@ -1165,8 +1293,20 @@ void Host_Init (void)
 	host_initialized = true;
 	Con_Printf ("\n========= Quake Initialized =========\n\n");
 
+	if (!COM_CheckParm ("-nomapchecks") && Sys_IsStartedFromMapEditor ())
+	{
+		Con_Printf ("Level editing environment detected, enabling map_checks\n(pass -nomapchecks or set map_checks to 0 to disable)\n");
+		Cvar_SetValueQuick (&map_checks, 1.f);
+	}
+
+	// the folder from the selection dialog is only remembered now,
+	// with the game data proven to actually work
+	COM_WriteSelectedBaseDir ();
+
 	if (cls.state != ca_dedicated)
 	{
+		// 2026 update compat: enable scr_usekfont (for word wrapping) in case mg3 is used with original id1 data.
+		Cvar_SetValueQuick (&scr_usekfont, mg3 ? 1.0f : 0.0f);
 		Cbuf_InsertText ("exec quake.rc\n");
 		// johnfitz -- in case the vid mode was locked during vid_init, we can unlock it now.
 		// note: two leading newlines because the command buffer swallows one of them.
@@ -1214,12 +1354,15 @@ void Host_Shutdown (void)
 	{
 		if (con_initialized)
 			History_Shutdown ();
+		ExtraMaps_ShutDown ();
 		BGM_Shutdown ();
 		CDAudio_Shutdown ();
 		S_Shutdown ();
 		IN_Shutdown ();
 		VID_Shutdown ();
 	}
+
+	Steam_Shutdown ();
 
 	LOG_Close ();
 

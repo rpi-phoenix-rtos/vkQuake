@@ -25,6 +25,10 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 int r_dlightframecount;
 
+// dlight origins in the space of the model currently having its lightmaps built: world space for the world model,
+// entity space for brush models (R_DrawBrushModel updates these while marking its surfaces)
+vec3_t lightmap_dlight_origins[MAX_DLIGHTS];
+
 extern cvar_t r_flatlightstyles; // johnfitz
 extern cvar_t r_lerplightstyles;
 extern cvar_t r_gpulightmapupdate;
@@ -170,7 +174,279 @@ void R_PushDlights (void)
 	{
 		if (l->die < cl.time || !l->radius)
 			continue;
+		VectorCopy (l->origin, lightmap_dlight_origins[i]);
 		R_MarkLights (l, i, cl.worldmodel->nodes);
+	}
+}
+
+/*
+=============================================================================
+
+2021 RERELEASE DYNAMIC LIGHT ENTITIES
+
+Dimension of the Machine places "dynamiclight" entities for shadow casting
+dynamic lights, e.g. behind the fans in hub and start. Their QC spawn function
+is empty ("No special functionality, just to hold dynamic shadowcasting lights
+for KEX"), the KEX engine reads them directly from the entity lump, so do the
+same and turn them into persistent dlights.
+
+The KEX shading math is public: QuakeEX.kpf ships the shader source, and
+ComputeLightShading/ComputeSpotLight in progs/includes/QuakeClusteredShading.inc
+add color * intensity * (range - dist) / range * saturate(N.L), spotlights
+scaled by a linear falloff from cone axis to edge, all multiplied by a shadow
+map term. KEX only renders them while its shadow system is enabled
+(r_staticshadows 0 removes the lights entirely), so they are tied to the ray
+traced occlusion path here as well.
+
+The updated id1 and ctf maps also carry "_shadowlight 1" keys on info_null
+entities, but those sit in areas whose lighting is fully baked into the
+lightmaps (the same maps have to look right in the classic renderer). Adding
+their light on top just double brightens the baked lighting, so they are
+deliberately not parsed.
+
+=============================================================================
+*/
+
+#define MAX_ENTITY_DLIGHTS 64
+#define ENTITY_DLIGHT_KEY  0x40000000 // dlight key space for entity dlights, outside entity indices
+
+extern cvar_t r_rtshadows;
+
+// scales the intensity of the rerelease dynamiclight entities; the KEX intensity
+// units don't map 1:1 onto lightmap space, so this is calibrated visually
+cvar_t r_entdlightscale = {"r_entdlightscale", "1", CVAR_NONE};
+
+typedef struct entity_dlight_s
+{
+	vec3_t origin;
+	vec3_t color;
+	float  radius;
+	float  intensity;
+	vec3_t cone_dir;
+	float  cone_cos; // <= -1: not a spotlight
+	float  start_fade_distance;
+	float  end_fade_distance;
+	int	   style;
+} entity_dlight_t;
+
+static entity_dlight_t entity_dlights[MAX_ENTITY_DLIGHTS];
+static int			   num_entity_dlights;
+
+/*
+=============
+R_ParseEntityDlights -- called at map load
+
+Parses "dynamiclight" entities out of the entity lump. The spot direction comes
+from an "angle" key or, in a second pass, the origin of the targeted entity
+=============
+*/
+void R_ParseEntityDlights (void)
+{
+	char		key[128], value[4096];
+	const char *data;
+	char		targets[MAX_ENTITY_DLIGHTS][64];
+	float		cone_angles[MAX_ENTITY_DLIGHTS];
+
+	num_entity_dlights = 0;
+	if (!cl.worldmodel || !cl.worldmodel->entities)
+		return;
+
+	const qboolean coop_game = (cl.maxclients > 1) && (cl.gametype == GAME_COOP);
+	qboolean	   any_targets = false;
+
+	data = cl.worldmodel->entities;
+	while (num_entity_dlights < MAX_ENTITY_DLIGHTS)
+	{
+		data = COM_Parse (data);
+		if (!data || com_token[0] != '{')
+			break;
+
+		entity_dlight_t *l = &entity_dlights[num_entity_dlights];
+		memset (l, 0, sizeof (*l));
+		l->color[0] = l->color[1] = l->color[2] = 1.0f;
+		l->radius = 300.0f;
+		l->intensity = 10.0f;
+		l->cone_cos = -2.0f;
+
+		qboolean is_dynamiclight = false;
+		qboolean has_angle = false;
+		float	 angle = 0.0f;
+		float	 cone_angle = 0.0f;
+		int		 spawnflags = 0;
+		targets[num_entity_dlights][0] = 0;
+
+		while (1)
+		{
+			data = COM_Parse (data);
+			if (!data)
+				return;
+			if (com_token[0] == '}')
+				break;
+			q_strlcpy (key, com_token, sizeof (key));
+			while (key[0] && key[strlen (key) - 1] == ' ') // remove trailing spaces
+				key[strlen (key) - 1] = 0;
+			data = COM_ParseEx (data, CPE_ALLOWTRUNC);
+			if (!data)
+				return;
+			q_strlcpy (value, com_token, sizeof (value));
+
+			if (!strcmp (key, "classname"))
+				is_dynamiclight = !strcmp (value, "dynamiclight");
+			else if (!strcmp (key, "origin"))
+				sscanf (value, "%f %f %f", &l->origin[0], &l->origin[1], &l->origin[2]);
+			else if (!strcmp (key, "_color"))
+				sscanf (value, "%f %f %f", &l->color[0], &l->color[1], &l->color[2]);
+			else if (!strcmp (key, "_shadowlightradius"))
+				l->radius = atof (value);
+			else if (!strcmp (key, "_shadowlightintensity"))
+				l->intensity = atof (value);
+			else if (!strcmp (key, "_shadowlightconeangle"))
+				cone_angle = atof (value);
+			else if (!strcmp (key, "_shadowlightstartfadedistance"))
+				l->start_fade_distance = atof (value);
+			else if (!strcmp (key, "_shadowlightendfadedistance"))
+				l->end_fade_distance = atof (value);
+			else if (!strcmp (key, "_shadowlightstyle"))
+				l->style = CLAMP (0, atoi (value), MAX_LIGHTSTYLES - 1);
+			else if (!strcmp (key, "angle"))
+			{
+				angle = atof (value);
+				has_angle = true;
+			}
+			else if (!strcmp (key, "target"))
+				q_strlcpy (targets[num_entity_dlights], value, sizeof (targets[0]));
+			else if (!strcmp (key, "spawnflags"))
+				spawnflags = atoi (value);
+		}
+
+		if (!is_dynamiclight)
+			continue;
+		if (coop_game && (spawnflags & 1)) // DYNAMICLIGHT_NOT_IN_COOP
+			continue;
+
+		if (has_angle && (cone_angle > 0.0f))
+		{
+			if (angle == -1.0f) // up
+			{
+				l->cone_dir[0] = l->cone_dir[1] = 0.0f;
+				l->cone_dir[2] = 1.0f;
+			}
+			else if (angle == -2.0f) // down
+			{
+				l->cone_dir[0] = l->cone_dir[1] = 0.0f;
+				l->cone_dir[2] = -1.0f;
+			}
+			else
+			{
+				l->cone_dir[0] = cosf (DEG2RAD (angle));
+				l->cone_dir[1] = sinf (DEG2RAD (angle));
+				l->cone_dir[2] = 0.0f;
+			}
+			// _shadowlightconeangle is the full apex angle: KEX visibly lights surfaces
+			// sideways from the axis (e.g. the fan walls), impossible with a half angle read
+			l->cone_cos = cosf (DEG2RAD (cone_angle));
+		}
+		cone_angles[num_entity_dlights] = cone_angle;
+		any_targets = any_targets || (targets[num_entity_dlights][0] != 0);
+
+		++num_entity_dlights;
+	}
+
+	if (num_entity_dlights > 0)
+		Con_DPrintf ("%d entity dlights\n", num_entity_dlights);
+
+	if (!any_targets)
+		return;
+
+	// resolve spot directions from targeted entities, "target" wins over "angle"
+	data = cl.worldmodel->entities;
+	while (1)
+	{
+		data = COM_Parse (data);
+		if (!data || com_token[0] != '{')
+			break;
+
+		char   targetname[64] = "";
+		vec3_t origin = {0.0f, 0.0f, 0.0f};
+
+		while (1)
+		{
+			data = COM_Parse (data);
+			if (!data)
+				return;
+			if (com_token[0] == '}')
+				break;
+			q_strlcpy (key, com_token, sizeof (key));
+			while (key[0] && key[strlen (key) - 1] == ' ') // remove trailing spaces
+				key[strlen (key) - 1] = 0;
+			data = COM_ParseEx (data, CPE_ALLOWTRUNC);
+			if (!data)
+				return;
+			q_strlcpy (value, com_token, sizeof (value));
+
+			if (!strcmp (key, "targetname"))
+				q_strlcpy (targetname, value, sizeof (targetname));
+			else if (!strcmp (key, "origin"))
+				sscanf (value, "%f %f %f", &origin[0], &origin[1], &origin[2]);
+		}
+
+		if (!targetname[0])
+			continue;
+		for (int i = 0; i < num_entity_dlights; i++)
+		{
+			if ((cone_angles[i] <= 0.0f) || strcmp (targets[i], targetname) != 0)
+				continue;
+			vec3_t dir;
+			VectorSubtract (origin, entity_dlights[i].origin, dir);
+			if (VectorLength (dir) > 0.0f)
+			{
+				VectorNormalize (dir);
+				VectorCopy (dir, entity_dlights[i].cone_dir);
+				entity_dlights[i].cone_cos = cosf (DEG2RAD (cone_angles[i]));
+			}
+		}
+	}
+}
+
+/*
+=============
+R_UpdateEntityDlights -- called every frame, keeps the parsed entity dlights alive
+=============
+*/
+void R_UpdateEntityDlights (void)
+{
+	// KEX ties these lights to its shadow system (r_staticshadows 0 removes them
+	// entirely), so require the ray traced occlusion path here as well. They light
+	// whole rooms that get retraced every frame, which is much more expensive than
+	// the transient dlights, so r_rtshadows 1 (low) leaves them off
+	if (!vulkan_globals.ray_query || (r_rtshadows.value < 2.0f) || !r_gpulightmapupdate.value)
+		return;
+
+	for (int i = 0; i < num_entity_dlights; i++)
+	{
+		entity_dlight_t *l = &entity_dlights[i];
+		float			 intensity = ((float)d_lightstylevalue[l->style] / 256.0f) * l->intensity * r_entdlightscale.value;
+		if (l->end_fade_distance > 0.0f)
+		{
+			vec3_t offset;
+			VectorSubtract (l->origin, r_refdef.vieworg, offset);
+			const float view_distance = VectorLength (offset);
+			if (view_distance >= l->end_fade_distance)
+				continue;
+			if ((view_distance > l->start_fade_distance) && (l->end_fade_distance > l->start_fade_distance))
+				intensity *= (l->end_fade_distance - view_distance) / (l->end_fade_distance - l->start_fade_distance);
+		}
+		if (intensity <= 0.0f)
+			continue;
+
+		dlight_t *dl = CL_AllocDlight (ENTITY_DLIGHT_KEY + i);
+		VectorCopy (l->origin, dl->origin);
+		dl->radius = l->radius;
+		dl->die = cl.time + 0.001f;
+		VectorCopy (l->color, dl->color);
+		VectorCopy (l->cone_dir, dl->cone_dir);
+		dl->cone_cos = l->cone_cos;
+		dl->kex_intensity = intensity;
 	}
 }
 

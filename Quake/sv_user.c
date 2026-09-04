@@ -41,7 +41,7 @@ static qboolean onground;
 static usercmd_t cmd;
 
 cvar_t sv_idealpitchscale = {"sv_idealpitchscale", "0.8", CVAR_NONE};
-cvar_t sv_altnoclip = {"sv_altnoclip", "1", CVAR_ARCHIVE}; // johnfitz
+cvar_t sv_altnoclip = {"sv_altnoclip", "1", CVAR_ARCHIVE_GAME}; // johnfitz
 
 /*
 ===============
@@ -144,9 +144,42 @@ void SV_UserFriction (void)
 	else
 		friction = sv_friction.value;
 
-	// apply friction
-	control = speed < sv_stopspeed.value ? sv_stopspeed.value : speed;
-	newspeed = speed - host_frametime * control * friction;
+	// apply friction, matching the canonical 72Hz decay for any frame duration:
+	// exponential while speed is above stopspeed, then linear below it
+	{
+		extern qboolean sv_analyticphysics_frame;
+
+		const double tau = 1.0 / MAX_PHYSICS_FREQ;
+		double		 s = host_frametime / tau;
+		double		 r = 1.0 - friction * tau;
+		double		 ns = speed;
+
+		if (!sv_analyticphysics_frame || r <= 0)
+		{
+			// classic frame-dependent formula; also for degenerate friction values that stop within one tick
+			control = speed < sv_stopspeed.value ? sv_stopspeed.value : speed;
+			ns = speed - host_frametime * control * friction;
+		}
+		else
+		{
+			if (ns >= sv_stopspeed.value)
+			{
+				double k_cross = log (sv_stopspeed.value / ns) / log (r);
+				if (s <= k_cross)
+				{
+					ns *= pow (r, s);
+					s = 0;
+				}
+				else
+				{
+					ns = sv_stopspeed.value;
+					s -= k_cross;
+				}
+			}
+			ns -= s * tau * friction * sv_stopspeed.value;
+		}
+		newspeed = (float)ns;
+	}
 
 	if (newspeed < 0)
 		newspeed = 0;
@@ -248,12 +281,19 @@ void SV_WaterMove (void)
 	wishspeed *= 0.7;
 
 	//
-	// water friction
+	// water friction, matching the canonical 72Hz decay for any frame duration
 	//
 	speed = VectorLength (velocity);
 	if (speed)
 	{
-		newspeed = speed - host_frametime * speed * sv_friction.value;
+		extern qboolean sv_analyticphysics_frame;
+
+		const double tau = 1.0 / MAX_PHYSICS_FREQ;
+		double		 r = 1.0 - sv_friction.value * tau;
+		if (!sv_analyticphysics_frame || r <= 0)
+			newspeed = speed - host_frametime * speed * sv_friction.value;
+		else
+			newspeed = speed * pow (r, host_frametime / tau);
 		if (newspeed < 0)
 			newspeed = 0;
 		VectorScale (velocity, newspeed / speed, velocity);

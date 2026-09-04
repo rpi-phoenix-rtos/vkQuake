@@ -28,27 +28,30 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // references them even when on a unix system.
 
 // these two are not intended to be set directly
-cvar_t cl_name = {"_cl_name", "player", CVAR_ARCHIVE};
-cvar_t cl_color = {"_cl_color", "0", CVAR_ARCHIVE};
+cvar_t cl_name = {"_cl_name", "player", CVAR_ARCHIVE_GAME | CVAR_USERINFO};
+
+cvar_t cl_topcolor = {"topcolor", "0", CVAR_ARCHIVE_GAME | CVAR_USERINFO};
+cvar_t cl_bottomcolor = {"bottomcolor", "0", CVAR_ARCHIVE_GAME | CVAR_USERINFO};
 
 cvar_t cl_shownet = {"cl_shownet", "0", CVAR_NONE}; // can be 0, 1, or 2
 cvar_t cl_nolerp = {"cl_nolerp", "0", CVAR_NONE};
 
-cvar_t cfg_unbindall = {"cfg_unbindall", "1", CVAR_ARCHIVE};
+cvar_t cfg_unbindall = {"cfg_unbindall", "1", CVAR_ARCHIVE_GAME};
 
 cvar_t lookspring = {"lookspring", "0", CVAR_NONE};
 cvar_t lookstrafe = {"lookstrafe", "0", CVAR_NONE};
-cvar_t sensitivity = {"sensitivity", "3", CVAR_ARCHIVE};
+cvar_t sensitivity = {"sensitivity", "3", CVAR_ARCHIVE_GAME};
 
-cvar_t m_pitch = {"m_pitch", "0.022", CVAR_ARCHIVE};
-cvar_t m_yaw = {"m_yaw", "0.022", CVAR_ARCHIVE};
-cvar_t m_forward = {"m_forward", "1", CVAR_ARCHIVE};
-cvar_t m_side = {"m_side", "0.8", CVAR_ARCHIVE};
+cvar_t m_pitch = {"m_pitch", "0.022", CVAR_ARCHIVE_GAME};
+cvar_t m_yaw = {"m_yaw", "0.022", CVAR_ARCHIVE_GAME};
+cvar_t m_forward = {"m_forward", "1", CVAR_ARCHIVE_GAME};
+cvar_t m_side = {"m_side", "0.8", CVAR_ARCHIVE_GAME};
 
-cvar_t cl_maxpitch = {"cl_maxpitch", "90", CVAR_ARCHIVE};  // johnfitz -- variable pitch clamping
-cvar_t cl_minpitch = {"cl_minpitch", "-90", CVAR_ARCHIVE}; // johnfitz -- variable pitch clamping
+cvar_t cl_maxpitch = {"cl_maxpitch", "90", CVAR_ARCHIVE_GAME};	// johnfitz -- variable pitch clamping
+cvar_t cl_minpitch = {"cl_minpitch", "-90", CVAR_ARCHIVE_GAME}; // johnfitz -- variable pitch clamping
 
 cvar_t cl_startdemos = {"cl_startdemos", "1", CVAR_ARCHIVE};
+cvar_t cl_confirmquit = {"cl_confirmquit", "0", CVAR_ARCHIVE};
 
 client_static_t cls;
 client_state_t	cl;
@@ -268,7 +271,7 @@ void CL_SignonReply (void)
 
 	case 2:
 		MSG_WriteByte (&cls.message, clc_stringcmd);
-		MSG_WriteString (&cls.message, va ("color %i %i\n", ((int)cl_color.value) >> 4, ((int)cl_color.value) & 0x0f));
+		MSG_WriteString (&cls.message, va ("color %i %i\n", (int)cl_topcolor.value, (int)cl_bottomcolor.value));
 
 		if (*cl.serverinfo)
 			Info_Enumerate (cls.userinfo, CL_SendInitialUserinfo, NULL);
@@ -371,6 +374,8 @@ dlight_t *CL_AllocDlight (int key)
 				memset (dl, 0, sizeof (*dl));
 				dl->key = key;
 				dl->color[0] = dl->color[1] = dl->color[2] = 1; // johnfitz -- lit support via lordhavoc
+				dl->cone_cos = -2.0f;
+				dl->kex_intensity = 0.0f;
 				return dl;
 			}
 		}
@@ -385,6 +390,8 @@ dlight_t *CL_AllocDlight (int key)
 			memset (dl, 0, sizeof (*dl));
 			dl->key = key;
 			dl->color[0] = dl->color[1] = dl->color[2] = 1; // johnfitz -- lit support via lordhavoc
+			dl->cone_cos = -2.0f;
+			dl->kex_intensity = 0.0f;
 			return dl;
 		}
 	}
@@ -393,6 +400,7 @@ dlight_t *CL_AllocDlight (int key)
 	memset (dl, 0, sizeof (*dl));
 	dl->key = key;
 	dl->color[0] = dl->color[1] = dl->color[2] = 1; // johnfitz -- lit support via lordhavoc
+	dl->cone_cos = -2.0f;
 	return dl;
 }
 
@@ -502,7 +510,7 @@ static qboolean CL_LerpEntity (entity_t *ent, vec3_t org, vec3_t ang, float frac
 		a = f;
 
 		// johnfitz -- don't cl_lerp entities that will be r_lerped
-		if (r_lerpmove.value && (ent->lerpflags & LERP_MOVESTEP))
+		if (r_lerpmove.value && ent->lerp.movestep)
 		{
 			f = 1;
 
@@ -645,6 +653,7 @@ void CL_RelinkEntities (void)
 	dlight_t *dl;
 	float	  frametime;
 	int		  modelflags;
+	qboolean  teleported;
 
 	// determine partial update time
 	frac = CL_LerpPoint ();
@@ -707,18 +716,24 @@ void CL_RelinkEntities (void)
 		{
 			ent->model = NULL;
 			R_FreeEntityBLAS (ent);
-			ent->lerpflags |= LERP_RESETMOVE | LERP_RESETANIM; // johnfitz -- next time this entity slot is reused, the lerp will need to be reset
 			InvalidateTraceLineCache ();
 			continue;
 		}
 
 		VectorCopy (ent->origin, oldorg);
 
-		if (CL_LerpEntity (ent, ent->origin, ent->angles, frac))
-			ent->lerpflags |= LERP_RESETMOVE;
+		teleported = CL_LerpEntity (ent, ent->origin, ent->angles, frac);
 
 		if (cl.time < cl.oldtime)
-			ent->lerpflags |= LERP_RESETMOVE | LERP_RESETANIM;
+		{
+			// time ran backwards (demo jump): show current state without lerping
+			ent->lerp.prev_frame = ent->frame;
+			ent->lerp.frame_change_time = 0;
+			ent->lerp.snap_frames = 0;
+			VectorCopy (ent->msg_origins[0], ent->lerp.prev_origin);
+			VectorCopy (ent->msg_angles[0], ent->lerp.prev_angles);
+			ent->lerp.move_change_time = 0;
+		}
 
 		if (ent->netstate.tagentity)
 			if (!CL_AttachEntity (ent, frac))
@@ -730,7 +745,7 @@ void CL_RelinkEntities (void)
 		modelflags = (ent->effects >> 24) & 0xff;
 		modelflags |= ent->model->flags;
 
-		if (ent->forcelink || ent->lerpflags & LERP_RESETMOVE)
+		if (ent->forcelink || teleported)
 			CL_ResetTrail (ent);
 
 		// rotate binary objects locally
@@ -754,13 +769,32 @@ void CL_RelinkEntities (void)
 			dl->minlight = 32;
 			dl->die = cl.time + 0.1;
 
-			// johnfitz -- assume muzzle flash accompanied by muzzle flare, which looks bad when lerped
+			// johnfitz -- assume muzzle flash accompanied by muzzle flare, which looks bad when lerped:
+			// snap the transition into the flash frame and the one out of it
 			if (r_lerpmodels.value != 2)
 			{
 				if (ent == &cl.entities[cl.viewentity])
-					cl.viewent.lerpflags |= LERP_RESETANIM | LERP_RESETANIM2; // no lerping for two frames
+				{
+					// viewent frame changes are detected later in V_CalcRefdef, so the
+					// transitions into and out of the flash frame both consume the counter.
+					// effects keeps the flash bit until the next update overwrites it and
+					// relink runs per render frame, so arm only once per server update
+					if (cl.viewent.lerp.snap_msgtime != ent->msgtime)
+					{
+						cl.viewent.lerp.prev_frame = cl.viewent.frame;
+						cl.viewent.lerp.frame_change_time = 0;
+						cl.viewent.lerp.snap_frames = 2;
+						cl.viewent.lerp.snap_msgtime = ent->msgtime;
+					}
+				}
 				else
-					ent->lerpflags |= LERP_RESETANIM | LERP_RESETANIM2; // no lerping for two frames
+				{
+					// the flash frame arrived in the same packet and was already recorded
+					// at parse; snap it retroactively, the counter covers the change out
+					ent->lerp.prev_frame = ent->frame;
+					ent->lerp.frame_change_time = 0;
+					ent->lerp.snap_frames = 1;
+				}
 			}
 			// johnfitz
 		}
@@ -895,24 +929,10 @@ void CL_RelinkEntities (void)
 			R_AllocateEntityBLAS (ent);
 			cl_visedicts[cl_numvisedicts] = ent;
 			cl_numvisedicts++;
-			// Update animation state for alias models
-			if (ent->model && ent->model->type == mod_alias)
-			{
-				aliashdr_t *hdr = (aliashdr_t *)Mod_Extradata (ent->model);
-				if (hdr)
-					R_UpdateEntityAnimState (ent, hdr);
-				R_UpdateEntityMoveState (ent);
-			}
 		}
 	}
 
-	// johnfitz -- lerping
-	// ericw -- this was done before the upper 8 bits of cl.stats[STAT_WEAPON] were filled in, breaking on large maps like zendar.bsp
-	if (cl.viewent.model != cl.model_precache[cl.stats[STAT_WEAPON]])
-	{
-		cl.viewent.lerpflags |= LERP_RESETANIM; // don't lerp animation across model changes
-	}
-	// johnfitz
+	R_UpdateEntityDlights (); // 2021 rerelease shadow casting light entities
 }
 
 #ifdef PSET_SCRIPT
@@ -1134,11 +1154,32 @@ void CL_Viewpos_f (void)
 		(int)r_refdef.viewangles[YAW],
 		(int)r_refdef.viewangles[ROLL]);
 #else
+	char buf[256];
 	// player position
-	Con_Printf (
-		"Viewpos: (%i %i %i) %i %i %i\n", (int)cl.entities[cl.viewentity].origin[0], (int)cl.entities[cl.viewentity].origin[1],
+	q_snprintf (
+		buf, sizeof (buf), "(%i %i %i) %i %i %i", (int)cl.entities[cl.viewentity].origin[0], (int)cl.entities[cl.viewentity].origin[1],
 		(int)cl.entities[cl.viewentity].origin[2], (int)cl.viewangles[PITCH], (int)cl.viewangles[YAW], (int)cl.viewangles[ROLL]);
+
+	// player position
+	Con_SafePrintf ("Viewpos: %s\n", buf);
+
+	if (Cmd_Argc () >= 2 && !q_strcasecmp (Cmd_Argv (1), "copy"))
+	{
+		SDL_SetClipboardText (buf);
+	}
 #endif
+}
+
+/*
+===============
+CL_Viewpos_Completion_f -- tab completion for the viewpos command
+===============
+*/
+static void CL_Viewpos_Completion_f (const char *partial)
+{
+	if (Cmd_Argc () != 2)
+		return;
+	Con_AddToTabList ("copy", partial, NULL);
 }
 
 static void CL_ServerExtension_FullServerinfo_f (void)
@@ -1194,6 +1235,126 @@ static void CL_ServerExtension_UserinfoUpdate_f (void)
 	}
 }
 
+static void SV_DecodeUserInfo (client_t *client)
+{
+	char tmp[64];
+	int	 top, bot;
+
+	// figure out the player's colours
+	Info_GetKey (client->userinfo, "topcolor", tmp, sizeof (tmp));
+	top = atoi (tmp) & 15;
+	if (top > 13)
+		top = 13;
+	Info_GetKey (client->userinfo, "bottomcolor", tmp, sizeof (tmp));
+	bot = atoi (tmp) & 15;
+	if (bot > 13)
+		bot = 13;
+	// update their entity
+	client->edict->v.team = bot + 1;
+	client->colors = (top << 4) | bot;
+
+	// pick out a name and try to clean it up a little.
+	Info_GetKey (client->userinfo, "name", tmp, sizeof (tmp));
+
+	if (!*tmp)
+		q_strlcpy (tmp, "unnamed", sizeof (tmp));
+
+	if (strcmp (client->name, tmp) != 0)
+	{ // name changed.
+		if (client->name[0] && strcmp (client->name, "unconnected"))
+			Con_DPrintf ("\"%s\" renamed to \"%s\"\n", client->name, tmp);
+		q_strlcpy (client->name, tmp, sizeof (client->name));
+
+		client->edict->v.netname = PR_SetEngineString (client->name);
+	}
+}
+void SV_UpdateInfo (int edict, const char *keyname, const char *value)
+{
+	char oldvalue[1024];
+
+	char	   *info;
+	size_t		infosize;
+	const char *pre;
+	client_t   *infoplayer = NULL;
+
+	if (!edict)
+	{
+		cvar_t *var = Cvar_FindVar (keyname);
+		if (var && var->flags & CVAR_SERVERINFO)
+		{
+			Cvar_Set (var->name, value);
+			return;
+		}
+		info = svs.serverinfo;
+		infosize = sizeof (svs.serverinfo);
+		pre = "//svi ";
+	}
+	else if (edict <= svs.maxclients)
+	{
+		edict -= 1;
+		infoplayer = &svs.clients[edict];
+		info = infoplayer->userinfo;
+		infosize = sizeof (infoplayer->userinfo);
+		pre = va ("//ui %i", edict);
+	}
+	else
+		return;
+
+	Info_GetKey (info, keyname, oldvalue, sizeof (oldvalue));
+
+	if (strcmp (value, oldvalue))
+	{
+		// its changed. actually broadcast it.
+		Info_SetKey (info, infosize, keyname, value);
+
+		if (infoplayer)
+			SV_DecodeUserInfo (infoplayer);
+
+		if (*keyname == '_' || !sv.active)
+			return; // underscore means private (user) keys. these are not networked to clients.
+
+		Info_GetKey (info, keyname, oldvalue, sizeof (oldvalue));
+		value = oldvalue;
+
+		for (client_t *current_client = svs.clients; current_client < svs.clients + svs.maxclients; current_client++)
+		{
+			if (current_client->active)
+			{
+				if (current_client->protocol_pext2 & PEXT2_PREDINFO)
+				{
+					MSG_WriteByte (&current_client->message, svc_stufftext);
+					MSG_WriteString (&current_client->message, va ("%s \"%s\" \"%s\"\n", pre, keyname, value));
+				}
+				else if (infoplayer && !strcmp (keyname, "name"))
+				{
+					MSG_WriteByte (&current_client->message, svc_updatename);
+					MSG_WriteByte (&current_client->message, edict);
+					MSG_WriteString (&current_client->message, value);
+				}
+				else if (infoplayer && (!strcmp (keyname, "topcolor") || !strcmp (keyname, "bottomcolor")))
+				{
+					MSG_WriteByte (&current_client->message, svc_updatecolors);
+					MSG_WriteByte (&current_client->message, edict);
+					MSG_WriteByte (&current_client->message, infoplayer->colors);
+				}
+			}
+		}
+	}
+}
+
+static void CL_ServerExtension_Ignore_f (void)
+{
+	Con_DPrintf2 ("Ignoring stufftext: %s\n", Cmd_Argv (0));
+}
+
+static void CL_LegacyColor_f (void)
+{
+	// spike -- code to handle the legacy _cl_color cvar (we now use separate qw-style topcolor/bottomcolor userinfo cvars)
+	int col = atoi (Cmd_Argv (1));
+	Cvar_SetValue ("topcolor", (col >> 4) & 0xf);
+	Cvar_SetValue ("bottomcolor", (col >> 0) & 0xf);
+}
+
 /*
 =================
 CL_Init
@@ -1206,8 +1367,12 @@ void CL_Init (void)
 	CL_InitInput ();
 	CL_InitTEnts ();
 
+	cmd_function_t *cmd;
+
 	Cvar_RegisterVariable (&cl_name);
-	Cvar_RegisterVariable (&cl_color);
+	Cvar_RegisterVariable (&cl_topcolor);
+	Cvar_RegisterVariable (&cl_bottomcolor);
+	Cmd_AddCommand ("_cl_color", CL_LegacyColor_f); // for loading vanilla configs (we have separate qw-style topcolor/bottomcolor userinfo cvars instead)
 	Cvar_RegisterVariable (&cl_upspeed);
 	Cvar_RegisterVariable (&cl_forwardspeed);
 	Cvar_RegisterVariable (&cl_backspeed);
@@ -1235,6 +1400,7 @@ void CL_Init (void)
 	Cvar_RegisterVariable (&cl_minpitch); // johnfitz -- variable pitch clamping
 
 	Cvar_RegisterVariable (&cl_startdemos);
+	Cvar_RegisterVariable (&cl_confirmquit);
 
 	Cmd_AddCommand ("entities", CL_PrintEntities_f);
 	Cmd_AddCommand ("disconnect", CL_Disconnect_f);
@@ -1244,8 +1410,10 @@ void CL_Init (void)
 	Cmd_AddCommand ("timedemo", CL_TimeDemo_f);
 	Cmd_AddCommand ("seek", CL_Seek_f);
 
-	Cmd_AddCommand ("tracepos", CL_Tracepos_f); // johnfitz
-	Cmd_AddCommand ("viewpos", CL_Viewpos_f);	// johnfitz
+	Cmd_AddCommand ("tracepos", CL_Tracepos_f);		// johnfitz
+	cmd = Cmd_AddCommand ("viewpos", CL_Viewpos_f); // johnfitz
+	if (cmd)
+		cmd->completion = CL_Viewpos_Completion_f;
 
 	// spike -- serverinfo stuff
 	Cmd_AddCommand_ServerCommand ("fullserverinfo", CL_ServerExtension_FullServerinfo_f);
@@ -1254,4 +1422,20 @@ void CL_Init (void)
 	// spike -- userinfo stuff
 	Cmd_AddCommand_ServerCommand ("fui", CL_ServerExtension_FullUserinfo_f);
 	Cmd_AddCommand_ServerCommand ("ui", CL_ServerExtension_UserinfoUpdate_f);
+
+	Cmd_AddCommand_ServerCommand ("paknames", CL_ServerExtension_Ignore_f);		 // package names in use by the server (including gamedir+extension)
+	Cmd_AddCommand_ServerCommand ("paks", CL_ServerExtension_Ignore_f);			 // provides hashes to go with the paknames list
+	Cmd_AddCommand_ServerCommand ("wps", CL_ServerExtension_Ignore_f);			 // ktx/cspree weapon stats
+	Cmd_AddCommand_ServerCommand ("it", CL_ServerExtension_Ignore_f);			 // cspree item timers
+	Cmd_AddCommand_ServerCommand ("tinfo", CL_ServerExtension_Ignore_f);		 // ktx team info
+	Cmd_AddCommand_ServerCommand ("exectrigger", CL_ServerExtension_Ignore_f);	 // spike
+	Cmd_AddCommand_ServerCommand ("csqc_progname", CL_ServerExtension_Ignore_f); // spike
+	Cmd_AddCommand_ServerCommand ("csqc_progsize", CL_ServerExtension_Ignore_f); // spike
+	Cmd_AddCommand_ServerCommand ("csqc_progcrc", CL_ServerExtension_Ignore_f);	 // spike
+	Cmd_AddCommand_ServerCommand ("cl_fullpitch", CL_ServerExtension_Ignore_f);	 // spike
+	Cmd_AddCommand_ServerCommand ("pq_fullpitch", CL_ServerExtension_Ignore_f);	 // spike
+
+	Cmd_AddCommand_ServerCommand ("cl_serverextension_download", CL_ServerExtension_Ignore_f); // spike
+	Cmd_AddCommand_ServerCommand ("cl_downloadbegin", CL_ServerExtension_Ignore_f);			   // spike
+	Cmd_AddCommand_ServerCommand ("cl_downloadfinished", CL_ServerExtension_Ignore_f);		   // spike
 }

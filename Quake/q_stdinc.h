@@ -29,6 +29,7 @@
 #ifndef __QSTDINC_H
 #define __QSTDINC_H
 
+#include <assert.h>
 #include <sys/types.h>
 #include <stddef.h>
 #include <limits.h>
@@ -108,9 +109,11 @@ COMPILE_TIME_ASSERT (enum, sizeof (THE_DUMMY_ENUM) == sizeof (int));
 /* Provide a substitute for offsetof() if we don't have one.
  * This variant works on most (but not *all*) systems...
  */
+// clang-format off
 #ifndef offsetof
-#define offsetof(t, m) ((intptr_t) & (((t *)0)->m))
+#define offsetof(t, m) ((intptr_t)&(((t *)0)->m))
 #endif
+// clang-format on
 
 /*==========================================================================*/
 

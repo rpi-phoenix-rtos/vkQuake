@@ -23,6 +23,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "arch_def.h"
 #include "quakedef.h"
+#include "steam.h"
 
 #include <sys/types.h>
 #include <errno.h>
@@ -36,9 +37,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <fcntl.h>
-#ifdef DO_USERDIRS
+#include <dirent.h>
 #include <pwd.h>
-#endif
 
 #if defined(PLATFORM_UNIX) && !defined(PLATFORM_OSX) && !defined(PLATFORM_BSD) && !defined(TASK_AFFINITY_NOT_AVAILABLE)
 #include <sched.h>
@@ -77,6 +77,336 @@ int Sys_FileType (const char *path)
 		return FS_ENT_FILE;
 
 	return FS_ENT_NONE;
+}
+
+FILE *Sys_fopen (const char *path, const char *mode)
+{
+	if (strchr (mode, 'w'))
+	{
+		char dir[MAX_OSPATH];
+		int	 i, rc;
+		q_strlcpy (dir, path, sizeof (dir));
+		for (i = 1; dir[i]; i++)
+		{
+			if (dir[i] != '/')
+				continue;
+			dir[i] = '\0';
+			rc = mkdir (dir, 0777);
+			if (rc != 0 && errno == EEXIST)
+			{
+				struct stat st;
+				if (stat (dir, &st) == 0 && S_ISDIR (st.st_mode))
+					rc = 0;
+			}
+			if (rc != 0)
+				return NULL;
+			dir[i] = '/';
+		}
+	}
+
+	return fopen (path, mode);
+}
+
+static qboolean Sys_Exec (const char *cmd, ...)
+{
+	pid_t p = fork ();
+	if (p < 0) // fork failed
+		return false;
+	else if (p == 0) // child process
+	{
+		va_list		argptr;
+		const char *argv[1024];
+		size_t		argc;
+		FILE	   *dummy;
+
+		argv[0] = (char *)cmd;
+		argc = 1;
+
+		va_start (argptr, cmd);
+		for (; argc + 1 < countof (argv); argc++)
+		{
+			const char *cur = va_arg (argptr, const char *);
+			if (!cur)
+				break;
+			argv[argc] = cur;
+		}
+		va_end (argptr);
+		argv[argc++] = NULL;
+
+		// Disable stdout/stderr
+		// Note: using a dummy variable to avoid triggering -Wunused-result
+		dummy = freopen ("/dev/null", "w", stdout);
+		(void)dummy;
+		dummy = freopen ("/dev/null", "w", stderr);
+		(void)dummy;
+
+		execvp (cmd, (char *const *)argv);
+		exit (EXIT_FAILURE);
+	}
+	else // original process
+	{
+		return true;
+	}
+}
+
+qboolean Sys_Explore (const char *path)
+{
+	char  buf[32768];
+	char *s;
+
+	if (Sys_FileType (path) == FS_ENT_NONE)
+		return false;
+
+	// Try to identify the current desktop so we can open the parent dir in the file manager *and* select the right file in it
+	s = getenv ("XDG_CURRENT_DESKTOP");
+	if (s)
+	{
+		char *cur = NULL;
+		char *desktop = NULL;
+		q_strlcpy (buf, s, sizeof (buf));
+		for (desktop = strtok_r (buf, ":", &cur); desktop; desktop = strtok_r (NULL, ":", &cur))
+		{
+			if (q_strcasecmp (desktop, "gnome") == 0)
+				return Sys_Exec ("nautilus", "--select", path, NULL);
+			if (q_strcasecmp (desktop, "kde") == 0)
+				return Sys_Exec ("dolphin", "--select", path, NULL);
+		}
+	}
+
+	// Fall back to just opening the parent dir without selecting the file
+	q_strlcpy (buf, path, sizeof (buf));
+	s = strrchr (buf, '/');
+	if (!s)
+		return false;
+	s[1] = '\0'; // terminate after the slash
+#ifdef USE_SDL3
+	return SDL_OpenURL (buf);
+#else
+	return SDL_OpenURL (buf) == 0;
+#endif
+}
+
+/*
+==============================================================================
+STORE INSTALL LOCATIONS (from Ironwail)
+==============================================================================
+*/
+
+qboolean Sys_GetSteamDir (char *path, size_t pathsize)
+{
+	const char	  *home_dir = NULL;
+	struct passwd *pwent;
+
+	pwent = getpwuid (getuid ());
+	if (pwent == NULL)
+		perror ("getpwuid");
+	else
+		home_dir = pwent->pw_dir;
+	if (home_dir == NULL)
+		home_dir = getenv ("HOME");
+	if (home_dir == NULL)
+		return false;
+
+	if ((size_t)q_snprintf (path, pathsize, "%s/.steam/steam", home_dir) < pathsize && Steam_IsValidPath (path))
+		return true;
+	if ((size_t)q_snprintf (path, pathsize, "%s/.local/share/Steam", home_dir) < pathsize && Steam_IsValidPath (path))
+		return true;
+	if ((size_t)q_snprintf (path, pathsize, "%s/.var/app/com.valvesoftware.Steam/.steam/steam", home_dir) < pathsize && Steam_IsValidPath (path))
+		return true;
+	if ((size_t)q_snprintf (path, pathsize, "%s/.var/app/com.valvesoftware.Steam/.local/share/Steam", home_dir) < pathsize && Steam_IsValidPath (path))
+		return true;
+
+	return false;
+}
+
+qboolean Sys_GetSteamAPILibraryPath (char *path, size_t pathsize, const steamgame_t *game)
+{
+	char	 config_info_path[MAX_OSPATH];
+	char	*line = NULL;
+	size_t	 line_size = 0;
+	FILE	*config_info;
+	int		 read_lines;
+	qboolean result;
+
+	if ((size_t)q_snprintf (config_info_path, sizeof (config_info_path), "%s/steamapps/compatdata/%d/config_info", game->library, game->appid) >= pathsize)
+		return false;
+
+	config_info = fopen (config_info_path, "r");
+	if (!config_info)
+		return false;
+
+	// lib dir is on line 3, lib64 on line 4
+	read_lines = sizeof (void *) == 4 ? 3 : 4;
+	while (read_lines-- > 0)
+	{
+		if (getline (&line, &line_size, config_info) == -1)
+		{
+			fclose (config_info);
+			free (line); // getline buffer is libc-allocated, NOT Mem_Free
+			return false;
+		}
+	}
+
+	fclose (config_info);
+	if (!line)
+		return false;
+
+	line_size = strlen (line);
+
+	if (line_size > 0 && line[line_size - 1] == '\n')
+		line[--line_size] = '\0';
+	if (line_size > 0 && line[line_size - 1] == '/')
+		line[--line_size] = '\0';
+
+	result = (size_t)q_snprintf (path, pathsize, "%s/libsteam_api.so", line) < pathsize;
+
+	free (line); // getline buffer is libc-allocated, NOT Mem_Free
+
+	return result;
+}
+
+qboolean Sys_GetNightdiveUserDir (char *path, size_t pathsize, const char *steamlibrary)
+{
+	const char *fmt = "%s/steamapps/compatdata/%d/pfx/drive_c/users/steamuser/Saved Games/Nightdive Studios/Quake";
+
+	if (!steamlibrary)
+		return false;
+
+	return (size_t)q_snprintf (path, pathsize, fmt, steamlibrary, QUAKE_STEAM_APPID) < pathsize;
+}
+
+qboolean Sys_GetGOGQuakeDir (char *path, size_t pathsize)
+{
+	return false;
+}
+
+qboolean Sys_GetGOGQuakeEnhancedDir (char *path, size_t pathsize)
+{
+	return false;
+}
+
+qboolean Sys_GetEGSManifestDir (char *path, size_t pathsize)
+{
+	return false;
+}
+
+const char *Sys_GetEGSLauncherData (void)
+{
+	return NULL;
+}
+
+/*
+==============================================================================
+DIRECTORY ENUMERATION (from Ironwail)
+==============================================================================
+*/
+
+typedef struct unixfindfile_s
+{
+	findfile_t	   base;
+	char		   dir[MAX_OSPATH];
+	DIR			  *handle;
+	struct dirent *data;
+	char		   filter[8];
+} unixfindfile_t;
+
+static qboolean Sys_FindDataIsDirectory (const unixfindfile_t *find)
+{
+	struct stat st;
+	char		filepath[MAX_OSPATH];
+
+	switch (find->data->d_type)
+	{
+	case DT_DIR:
+		return true;
+	case DT_LNK:
+	case DT_UNKNOWN:
+		if ((size_t)q_snprintf (filepath, sizeof (filepath), "%s/%s", find->dir, find->data->d_name) >= sizeof (filepath))
+			return false;
+		return stat (filepath, &st) == 0 && S_ISDIR (st.st_mode);
+	default:
+		return false;
+	}
+}
+
+static void Sys_FillFindData (unixfindfile_t *find)
+{
+	q_strlcpy (find->base.name, find->data->d_name, sizeof (find->base.name));
+	find->base.attribs = 0;
+	if (Sys_FindDataIsDirectory (find))
+		find->base.attribs |= FA_DIRECTORY;
+}
+
+static struct dirent *readdir_filtered (DIR *handle, const char *ext)
+{
+	while (1)
+	{
+		struct dirent *data = readdir (handle);
+		if (!data || ext[0] == '*' || !q_strcasecmp (ext, COM_FileGetExtension (data->d_name)))
+			return data;
+	}
+	return NULL;
+}
+
+findfile_t *Sys_FindFirst (const char *dir, const char *ext)
+{
+	unixfindfile_t *ret;
+	DIR			   *handle;
+	struct dirent  *data;
+
+	if (!ext)
+		ext = "*";
+	else if (*ext == '.')
+		++ext;
+
+	if (strlen (ext) >= countof (ret->filter))
+		Sys_Error ("Sys_FindFirst: extension too long '%s'", ext);
+
+	handle = opendir (dir);
+	if (!handle)
+		return NULL;
+
+	data = readdir_filtered (handle, ext);
+	if (!data)
+	{
+		closedir (handle);
+		return NULL;
+	}
+
+	ret = (unixfindfile_t *)Mem_Alloc (sizeof (unixfindfile_t));
+	if (!ret)
+		Sys_Error ("Sys_FindFirst: out of memory");
+	if (q_strlcpy (ret->dir, dir, sizeof (ret->dir)) >= sizeof (ret->dir))
+		Sys_Error ("Sys_FindFirst: directory too long '%s'", dir);
+	ret->handle = handle;
+	ret->data = data;
+	q_strlcpy (ret->filter, ext, sizeof (ret->filter));
+	Sys_FillFindData (ret);
+
+	return (findfile_t *)ret;
+}
+
+findfile_t *Sys_FindNext (findfile_t *find)
+{
+	unixfindfile_t *ufind = (unixfindfile_t *)find;
+	ufind->data = readdir_filtered (ufind->handle, ufind->filter);
+	if (!ufind->data)
+	{
+		Sys_FindClose (find);
+		return NULL;
+	}
+	Sys_FillFindData (ufind);
+	return find;
+}
+
+void Sys_FindClose (findfile_t *find)
+{
+	if (find)
+	{
+		unixfindfile_t *ufind = (unixfindfile_t *)find;
+		closedir (ufind->handle);
+		Mem_Free (ufind);
+	}
 }
 
 static char cwd[MAX_OSPATH];
@@ -215,8 +545,57 @@ static void Sys_GetBasedir (char *argv0, char *dst, size_t dstsize)
 }
 #endif
 
+/*
+=================
+Sys_GetParentProcessName
+=================
+*/
+static qboolean Sys_GetParentProcessName (char *dst, size_t dstsize)
+{
+#ifdef __linux__
+	char	link[MAX_OSPATH];
+	ssize_t len;
+
+	if (dstsize == 0)
+		return false;
+
+	q_snprintf (link, sizeof (link), "/proc/%d/exe", getppid ());
+	len = readlink (link, dst, dstsize - 1);
+	if (len < 0)
+		return false;
+	dst[len] = '\0';
+	return true;
+#else
+	return false;
+#endif
+}
+
+/*
+=================
+Sys_IsStartedFromMapEditor
+
+Returns true if the process was started from a supported map editor.
+=================
+*/
+qboolean Sys_IsStartedFromMapEditor (void)
+{
+	char		path[MAX_OSPATH];
+	const char *slash, *exe;
+
+	if (!Sys_GetParentProcessName (path, sizeof (path)))
+		return false;
+
+	slash = strrchr (path, '/');
+	exe = slash ? slash + 1 : path;
+
+	return q_strcasestr (exe, "trenchbroom") != NULL || q_strcasestr (exe, "nextbroom") != NULL || q_strcasestr (exe, "jack") != NULL ||
+		   q_strcasestr (exe, "qrucible") != NULL;
+}
+
 void Sys_Init (void)
 {
+	Sys_FileInit ();
+
 	memset (cwd, 0, sizeof (cwd));
 	Sys_GetBasedir (host_parms->argv[0], cwd, sizeof (cwd));
 	host_parms->basedir = cwd;
@@ -253,7 +632,8 @@ static const char errortxt2[] = "\nQUAKE ERROR: ";
 
 void Sys_Error (const char *error, ...)
 {
-	host_parms->errstate++;
+	if (!Tasks_IsWorker ())
+		host_parms->errstate++;
 
 	va_list argptr;
 	va_start (argptr, error);
@@ -271,16 +651,22 @@ void Sys_Error (const char *error, ...)
 		Mem_Free (captured_stack_trace);
 	}
 
-	PR_SwitchQCVM (NULL);
+	if (!Tasks_IsWorker ())
+		PR_SwitchQCVM (NULL);
 
 	fputs (errortxt1, stdout);
-	Host_Shutdown ();
+
+	if (!Tasks_IsWorker ())
+		Host_Shutdown ();
+
 	fputs (errortxt2, stdout);
 
 	Sys_Printf ("%s\n\n", text);
 
-	if (!isDedicated && !Sys_IsInDebugger ())
+	if (!Tasks_IsWorker () && !isDedicated && !Sys_IsInDebugger ())
+	{
 		PL_ErrorDialog (text);
+	}
 
 	Mem_Free (text);
 

@@ -37,18 +37,18 @@ cvar_t scr_ofsy = {"scr_ofsy", "0", CVAR_NONE};
 cvar_t scr_ofsz = {"scr_ofsz", "0", CVAR_NONE};
 
 cvar_t cl_rollspeed = {"cl_rollspeed", "200", CVAR_NONE};
-cvar_t cl_rollangle = {"cl_rollangle", "2.0", CVAR_ARCHIVE};
+cvar_t cl_rollangle = {"cl_rollangle", "2.0", CVAR_ARCHIVE_GAME};
 
-cvar_t cl_bob = {"cl_bob", "0.02", CVAR_ARCHIVE};
+cvar_t cl_bob = {"cl_bob", "0.02", CVAR_ARCHIVE_GAME};
 cvar_t cl_bobcycle = {"cl_bobcycle", "0.6", CVAR_NONE};
 cvar_t cl_bobup = {"cl_bobup", "0.5", CVAR_NONE};
 
 cvar_t v_kicktime = {"v_kicktime", "0.5", CVAR_NONE};
 cvar_t v_kickroll = {"v_kickroll", "0.6", CVAR_NONE};
 cvar_t v_kickpitch = {"v_kickpitch", "0.6", CVAR_NONE};
-cvar_t v_gunkick = {"v_gunkick", "1", CVAR_ARCHIVE}; // johnfitz
+cvar_t v_gunkick = {"v_gunkick", "1", CVAR_ARCHIVE_GAME}; // johnfitz
 
-cvar_t v_autopitch = {"v_autopitch", "0", CVAR_ARCHIVE};
+cvar_t v_autopitch = {"v_autopitch", "0", CVAR_ARCHIVE_GAME};
 
 cvar_t v_iyaw_cycle = {"v_iyaw_cycle", "2", CVAR_NONE};
 cvar_t v_iroll_cycle = {"v_iroll_cycle", "0.5", CVAR_NONE};
@@ -59,8 +59,11 @@ cvar_t v_ipitch_level = {"v_ipitch_level", "0.3", CVAR_NONE};
 
 cvar_t v_idlescale = {"v_idlescale", "0", CVAR_NONE};
 
-cvar_t crosshair = {"crosshair", "1", CVAR_ARCHIVE};
-cvar_t crosshair_def = {"crosshair_def", "0", CVAR_ARCHIVE};
+cvar_t crosshair = {"crosshair", "1", CVAR_ARCHIVE_GAME};
+cvar_t crosshair_def = {"crosshair_def", "1", CVAR_ARCHIVE_GAME};
+cvar_t crosshair_size = {"crosshair_size", "18", CVAR_ARCHIVE_GAME};
+cvar_t crosshair_color = {"crosshair_color", "0", CVAR_ARCHIVE_GAME};
+cvar_t crosshair_alpha = {"crosshair_alpha", "1", CVAR_ARCHIVE_GAME};
 
 cvar_t gl_cshiftpercent = {"gl_cshiftpercent", "100", CVAR_NONE};
 cvar_t gl_cshiftpercent_contents = {"gl_cshiftpercent_contents", "100", CVAR_NONE}; // QuakeSpasm
@@ -68,7 +71,7 @@ cvar_t gl_cshiftpercent_damage = {"gl_cshiftpercent_damage", "100", CVAR_NONE};	
 cvar_t gl_cshiftpercent_bonus = {"gl_cshiftpercent_bonus", "100", CVAR_NONE};		// QuakeSpasm
 cvar_t gl_cshiftpercent_powerup = {"gl_cshiftpercent_powerup", "100", CVAR_NONE};	// QuakeSpasm
 
-cvar_t r_viewmodel_quake = {"r_viewmodel_quake", "0", CVAR_ARCHIVE};
+cvar_t r_viewmodel_quake = {"r_viewmodel_quake", "0", CVAR_ARCHIVE_GAME};
 
 extern int in_forward, in_forward2, in_back;
 
@@ -786,16 +789,33 @@ void V_CalcRefdef (void)
 			view->origin[2] += 0.5;
 	}
 
-	if (ent->lerpflags & LERP_FINISH)
+	view->lerp.frame_finish_time = ent->lerp.frame_finish_time;
+
+	// the weapon's frames come from stats, so its change detection lives here
+	// ericw -- model check is done after the upper 8 bits of cl.stats[STAT_WEAPON] are filled in (broke on large maps like zendar.bsp)
+	if (view->model != cl.model_precache[cl.stats[STAT_WEAPON]])
 	{
-		view->lerpflags |= LERP_FINISH;
-		view->lerpfinish = ent->lerpfinish;
+		// don't lerp animation across model changes
+		view->frame = cl.stats[STAT_WEAPONFRAME];
+		view->lerp.prev_frame = view->frame;
+		view->lerp.frame_change_time = 0;
+		view->lerp.snap_frames = 0;
 	}
-	else
-		view->lerpflags &= ~LERP_FINISH;
+	else if (view->frame != cl.stats[STAT_WEAPONFRAME])
+	{
+		if (view->lerp.snap_frames > 0)
+		{
+			view->lerp.snap_frames--;
+			view->lerp.prev_frame = cl.stats[STAT_WEAPONFRAME];
+		}
+		else
+			view->lerp.prev_frame = view->frame;
+		view->frame = cl.stats[STAT_WEAPONFRAME];
+		view->lerp.frame_change_time = cl.mtime[0];
+		view->lerp.frame_duration = (view->lerp.frame_finish_time > cl.mtime[0]) ? view->lerp.frame_finish_time - cl.mtime[0] : 0.1;
+	}
 
 	view->model = cl.model_precache[cl.stats[STAT_WEAPON]];
-	view->frame = cl.stats[STAT_WEAPONFRAME];
 	view->netstate.colormap = 0;
 
 	// johnfitz -- v_gunkick
@@ -890,10 +910,12 @@ the entity origin, so any view position inside that will be valid
 */
 extern vrect_t scr_vrect;
 
-void V_RenderView (qboolean use_tasks, task_handle_t begin_rendering_task, task_handle_t setup_frame_task, task_handle_t draw_done_task)
+void V_RenderView (
+	qboolean use_tasks, task_handle_t begin_rendering_task, task_handle_t setup_frame_task, task_handle_t draw_done_task, task_handle_t draw_gui_task)
 {
 	if (con_forcedup)
 	{
+		R_ClearDebugEntityInfo ();
 		render_warp = false;
 		render_scale = 1;
 		return;
@@ -906,7 +928,7 @@ void V_RenderView (qboolean use_tasks, task_handle_t begin_rendering_task, task_
 		CL_RelinkEntities ();
 	}
 
-	R_RenderView (use_tasks, begin_rendering_task, setup_frame_task, draw_done_task);
+	R_RenderView (use_tasks, begin_rendering_task, setup_frame_task, draw_done_task, draw_gui_task);
 	return;
 }
 
@@ -942,6 +964,9 @@ void V_Init (void)
 	Cvar_RegisterVariable (&v_idlescale);
 	Cvar_RegisterVariable (&crosshair);
 	Cvar_RegisterVariable (&crosshair_def);
+	Cvar_RegisterVariable (&crosshair_size);
+	Cvar_RegisterVariable (&crosshair_color);
+	Cvar_RegisterVariable (&crosshair_alpha);
 	Cvar_RegisterVariable (&gl_cshiftpercent);
 	Cvar_RegisterVariable (&gl_cshiftpercent_contents); // QuakeSpasm
 	Cvar_RegisterVariable (&gl_cshiftpercent_damage);	// QuakeSpasm

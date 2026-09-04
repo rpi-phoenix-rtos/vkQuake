@@ -66,11 +66,12 @@ interface from being ambiguous.
 typedef enum
 {
 	CVAR_NONE             = 0,
-	CVAR_ARCHIVE          = (1U << 0),	 // if set, causes it to be saved to config
-	CVAR_NOTIFY           = (1U << 1),	 // changes will be broadcasted to all players (q1)
-	CVAR_SERVERINFO       = (1U << 2),   // added to serverinfo will be sent to clients (q1/net_dgrm.c and qwsv)
-	CVAR_USERINFO         = (1U << 3),	 // added to userinfo, will be sent to server (qwcl)
-	CVAR_CHANGED          = (1U << 4),
+	CVAR_ARCHIVE          = (1U << 0),	 // saved to the global config
+	CVAR_ARCHIVE_GAME     = (1U << 1),	 // saved to the current game config
+	CVAR_NOTIFY           = (1U << 2),	 // changes will be broadcasted to all players (q1)
+	CVAR_SERVERINFO       = (1U << 3),   // added to serverinfo will be sent to clients (q1/net_dgrm.c and qwsv)
+	CVAR_USERINFO         = (1U << 4),	 // added to userinfo, will be sent to server (qwcl)
+	CVAR_CHANGED          = (1U << 5),
 	CVAR_ROM              = (1U << 6),
 	CVAR_LOCKED           = (1U << 8),	 // locked temporarily
 	CVAR_REGISTERED       = (1U << 10),  // the var is added to the list of variables
@@ -82,16 +83,18 @@ typedef enum
 // clang-format on
 
 typedef void (*cvarcallback_t) (struct cvar_s *);
+typedef void (*cvarcompletion_t) (struct cvar_s *var, const char *partial);
 
 typedef struct cvar_s
 {
-	const char	  *name;
-	const char	  *string;
-	cvarflags_t	   flags;
-	float		   value;
-	const char	  *default_string; // johnfitz -- remember defaults for reset function
-	cvarcallback_t callback;
-	struct cvar_s *next;
+	const char		*name;
+	const char		*string;
+	cvarflags_t		 flags;
+	float			 value;
+	const char		*default_string; // johnfitz -- remember defaults for reset function
+	cvarcallback_t	 callback;
+	cvarcompletion_t completion;
+	struct cvar_s	*next;
 } cvar_t;
 
 void Cvar_RegisterVariable (cvar_t *variable);
@@ -103,6 +106,9 @@ cvar_t *Cvar_Create (const char *name, const char *value);
 
 void Cvar_SetCallback (cvar_t *var, cvarcallback_t func);
 // set a callback function to the var
+
+void Cvar_SetCompletion (cvar_t *var, cvarcompletion_t func);
+// set a tab completion function for the var's argument
 
 void Cvar_Set (const char *var_name, const char *value);
 // equivelant to "<name> <variable>" typed at the console
@@ -131,9 +137,9 @@ qboolean Cvar_Command (void);
 // command.  Returns true if the command was a variable reference that
 // was handled. (print or change)
 
-void Cvar_WriteVariables (FILE *f);
+void Cvar_WriteVariables (FILE *f, cvarflags_t archive_flag);
 // Writes lines containing "set variable value" for all variables
-// with the CVAR_ARCHIVE flag set
+// with the requested archive flag set
 
 cvar_t *Cvar_FindVar (const char *var_name);
 cvar_t *Cvar_FindVarAfter (const char *prev_name, unsigned int with_flags);

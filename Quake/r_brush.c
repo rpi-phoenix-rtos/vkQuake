@@ -57,6 +57,7 @@ typedef struct
 	texture_t *texture;
 	short	   lightmap_idx;
 	short	   is_bmodel; // for gl_zfix
+	short	   is_decal;
 	int		   max_indices;
 } indirectdraw_t;
 
@@ -268,24 +269,36 @@ typedef struct lm_compute_surface_data_s
 } lm_compute_surface_data_t;
 COMPILE_TIME_ASSERT (lm_compute_surface_data_t, sizeof (lm_compute_surface_data_t) == 64);
 
+// keep in sync with bmodel_instance_t in globals.inc
+typedef struct bmodel_instance_s
+{
+	vec4_t transform[3];  // model to world, transposed rows
+	vec4_t local_vieworg; // view origin in model space, for backface culling
+} bmodel_instance_t;
+COMPILE_TIME_ASSERT (bmodel_instance_t, sizeof (bmodel_instance_t) == 64);
+
 typedef struct lm_compute_light_s
 {
 	vec3_t origin;
 	float  radius;
 	vec3_t color;
-	float  minlight;
+	float  minlight; // < 0: rerelease dynamiclight with intensity -minlight, using the KEX falloff
+	vec3_t cone_dir;
+	float  cone_cos; // cos of the spotlight apex angle, <= -1: not a spotlight
 } lm_compute_light_t;
-COMPILE_TIME_ASSERT (lm_compute_light_t, sizeof (lm_compute_light_t) == 32);
+COMPILE_TIME_ASSERT (lm_compute_light_t, sizeof (lm_compute_light_t) == 48);
 
 #define WORKGROUP_BOUNDS_BUFFER_SIZE ((LMBLOCK_WIDTH / 8) * (LMBLOCK_HEIGHT / 8) * sizeof (lm_compute_workgroup_bounds_t))
 
-vulkan_memory_t			   lights_buffer_memory;
+vulkan_memory_t			   frame_upload_buffers_memory;
 static vulkan_memory_t	   surface_data_buffer_memory;
+static vulkan_memory_t	   surface_submodels_buffer_memory;
 static vulkan_memory_t	   workgroup_bounds_buffer_memory;
 static vulkan_memory_t	   indirect_buffer_memory;
 static vulkan_memory_t	   indirect_index_buffer_memory;
 static vulkan_memory_t	   dyn_visibility_buffer_memory;
 static VkBuffer			   surface_data_buffer;
+static VkBuffer			   surface_submodels_buffer;
 static int				   num_surfaces;
 static VkBuffer			   indirect_buffer;
 static VkBuffer			   indirect_index_buffer;
@@ -294,8 +307,25 @@ static uint32_t			   dyn_visibility_offset; // for double-buffering
 static unsigned char	  *dyn_visibility_view;
 static VkBuffer			   lightstyles_scales_buffer;
 static VkBuffer			   lights_buffer;
+static VkBuffer			   submodel_transforms_buffer;
 static float			  *lightstyles_scales_buffer_mapped;
 static lm_compute_light_t *lights_buffer_mapped;
+static float			  *submodel_transforms_buffer_mapped;
+static vulkan_memory_t	   vertex_submodels_buffer_memory;
+static VkBuffer			   vertex_submodels_buffer;
+static VkBuffer			   bmodel_instances_buffer;
+static bmodel_instance_t  *bmodel_instances_buffer_mapped;
+
+// The first entity drawing a submodel through the indirect path each frame claims its instance slot,
+// additional entities sharing the submodel fall back to per-entity drawing
+static atomic_uint64_t bmodel_instance_claims[MAX_MODELS];
+
+// current_compute_buffer_index flips mid frame, latch the instance buffer half while the frame is set up
+static int bmodel_instances_index;
+
+// Movable brush submodels ('*' models) have their lightmap texels lit in entity space: per surface the submodel
+// index selects a per-frame model to world transform that is also used to cull dlights per workgroup on the GPU
+static int num_worldmodel_submodels;
 
 static int current_compute_buffer_index;
 
@@ -571,6 +601,30 @@ static void R_RecursiveNode (
 
 /*
 =================
+R_ClearBModelInstanceClaims
+=================
+*/
+void R_ClearBModelInstanceClaims (void)
+{
+	bmodel_instances_index = current_compute_buffer_index;
+	memset ((void *)bmodel_instance_claims, 0, num_worldmodel_submodels * sizeof (bmodel_instance_claims[0]));
+}
+
+/*
+=================
+R_ClaimBModelInstance
+=================
+*/
+static qboolean R_ClaimBModelInstance (entity_t *e, int submodel)
+{
+	uint64_t expected = 0;
+	if (Atomic_CompareExchangeUInt64 (&bmodel_instance_claims[submodel], &expected, (uint64_t)(uintptr_t)e))
+		return true;
+	return expected == (uint64_t)(uintptr_t)e;
+}
+
+/*
+=================
 R_IndirectBrush
 =================
 */
@@ -578,9 +632,22 @@ qboolean R_IndirectBrush (entity_t *e)
 {
 	assert (e->model->type == mod_brush);
 	const qboolean transparent_entity = ENTALPHA_DECODE (e->alpha) != 1.0f;
-	const qboolean alpha_sorted = !oit_active && (transparent_entity || (WATER_FIXED_ORDER && brush_deps_data[e->model->combined_deps].water_count != 0));
-	return indirect && !(transparent_entity || alpha_sorted || e->origin[0] || e->origin[1] || e->origin[2] || e->angles[0] || e->angles[1] || e->angles[2] ||
-						 ENTSCALE_DECODE (e->netstate.scale) != 1.0f || e->frame != 0 || e->model->name[0] != '*');
+	const qboolean has_water = brush_deps_data[e->model->combined_deps].water_count != 0;
+	// the indirect path only knows global water alpha, so entities with fixed alpha need per-entity drawing
+	const qboolean fixed_alpha_water = e->alpha != ENTALPHA_DEFAULT && has_water;
+	// without OIT, water needs the stable draw order of the texture chains even in indirect mode
+	const qboolean alpha_sorted = !R_UseOIT () && (transparent_entity || has_water);
+	if (!indirect || transparent_entity || fixed_alpha_water || alpha_sorted || (e->frame != 0) || (e->model->name[0] != '*'))
+		return false;
+	const qboolean transformed =
+		e->origin[0] || e->origin[1] || e->origin[2] || e->angles[0] || e->angles[1] || e->angles[2] || (ENTSCALE_DECODE (e->netstate.scale) != 1.0f);
+	// sky surfaces are drawn with pipelines that don't apply instance transforms
+	if (transformed && (e->model->used_specials & SURF_DRAWSKY))
+		return false;
+	const int submodel = atoi (e->model->name + 1);
+	if ((submodel <= 0) || (submodel >= num_worldmodel_submodels))
+		return !transformed;
+	return R_ClaimBModelInstance (e, submodel);
 }
 
 /*
@@ -604,6 +671,38 @@ void R_DrawBrushModel (cb_context_t *cbx, entity_t *e, int chain, int *brushpoly
 
 	if (!water_opaque_only && !water_transparent_only && R_IndirectBrush (e))
 	{
+		const int submodel = atoi (clmodel->name + 1);
+		if ((submodel > 0) && (submodel < num_worldmodel_submodels))
+		{
+			bmodel_instance_t *instance = bmodel_instances_buffer_mapped + ((size_t)bmodel_instances_index * MAX_MODELS) + submodel;
+
+			vec3_t e_angles;
+			VectorCopy (e->angles, e_angles);
+			e_angles[0] = -e_angles[0]; // stupid quake bug
+			float model_matrix[16];
+			IdentityMatrix (model_matrix);
+			R_RotateForEntity (model_matrix, e->origin, e_angles, e->netstate.scale);
+			for (int row = 0; row < 3; ++row)
+				for (int col = 0; col < 4; ++col)
+					instance->transform[row][col] = model_matrix[(col * 4) + row];
+
+			// same backface culling origin as the per-entity path below: rotated into model space, unscaled
+			VectorSubtract (r_refdef.vieworg, e->origin, modelorg);
+			if (e->angles[0] || e->angles[1] || e->angles[2])
+			{
+				vec3_t temp;
+				vec3_t forward, right, up;
+
+				VectorCopy (modelorg, temp);
+				AngleVectors (e->angles, forward, right, up);
+				modelorg[0] = DotProduct (temp, forward);
+				modelorg[1] = -DotProduct (temp, right);
+				modelorg[2] = DotProduct (temp, up);
+			}
+			VectorCopy (modelorg, instance->local_vieworg);
+			instance->local_vieworg[3] = e->is_static;
+		}
+
 		// indirect mark
 		int				 start = clmodel->firstmodelsurface;
 		int				 end = start + clmodel->nummodelsurfaces;
@@ -648,7 +747,22 @@ void R_DrawBrushModel (cb_context_t *cbx, entity_t *e, int chain, int *brushpoly
 			if ((cl_dlights[k].die < cl.time) || (!cl_dlights[k].radius))
 				continue;
 
-			R_MarkLights (&cl_dlights[k], k, clmodel->nodes + clmodel->hulls[0].firstclipnode);
+			// transform the light into entity space, the surfaces and nodes of moved brush models are in model space
+			dlight_t local_light = cl_dlights[k];
+			VectorSubtract (local_light.origin, e->origin, local_light.origin);
+			if (e->angles[0] || e->angles[1] || e->angles[2])
+			{
+				vec3_t temp;
+				vec3_t forward, right, up;
+
+				VectorCopy (local_light.origin, temp);
+				AngleVectors (e->angles, forward, right, up);
+				local_light.origin[0] = DotProduct (temp, forward);
+				local_light.origin[1] = -DotProduct (temp, right);
+				local_light.origin[2] = DotProduct (temp, up);
+			}
+			VectorCopy (local_light.origin, lightmap_dlight_origins[k]); // for R_AddDynamicLights
+			R_MarkLights (&local_light, k, clmodel->nodes + clmodel->hulls[0].firstclipnode);
 		}
 	}
 
@@ -795,6 +909,10 @@ void R_DrawIndirectBrushes (cb_context_t *cbx, qboolean draw_water, qboolean tra
 		if (r_lightmap_cheatsafe)
 			vulkan_globals.vk_cmd_bind_descriptor_sets (
 				cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.world_pipeline_layout.handle, 0, 1, &greytexture->descriptor_set, 0, NULL);
+		vulkan_globals.vk_cmd_bind_descriptor_sets (
+			cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.world_pipeline_layout.handle, 4, 1, &vulkan_globals.bmodel_instances_desc_set, 0, NULL);
+		const uint32_t instance_base = ((uint32_t)bmodel_instances_index * MAX_MODELS) + 1;
+		R_PushConstants (cbx, VK_SHADER_STAGE_ALL_GRAPHICS, 21 * sizeof (float), sizeof (uint32_t), &instance_base);
 	}
 
 	gltexture_t *lastfullbright = NULL;
@@ -861,13 +979,15 @@ void R_DrawIndirectBrushes (cb_context_t *cbx, qboolean draw_water, qboolean tra
 			const qboolean alpha_blend = alpha < 1.0f;
 			int			   pipeline_index =
 				(fullbright_enabled ? 1 : 0) + (alpha_test ? 2 : 0) + (alpha_blend ? 4 : 0) + (vid_filter.value != 0 && vid_palettize.value != 0 ? 8 : 0);
-			vulkan_pipeline_t pipeline = cbx->render_pass_index == RENDER_PASS_INDEX_WBOIT
-											 ? vulkan_globals.world_wboit_pipelines[pipeline_index]
-											 : vulkan_globals.world_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index];
+			vulkan_pipeline_t pipeline = R_PipelineForRenderPass (
+				cbx->render_pass_index, vulkan_globals.world_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index],
+				vulkan_globals.world_wboit_pipelines[pipeline_index], vulkan_globals.world_mboit_moment_pipelines[pipeline_index],
+				vulkan_globals.world_mboit_composite_pipelines[pipeline_index]);
 			R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
-			qboolean use_zbias = INDIRECT_ZBIAS && gl_zfix.value && indirect_draws[i].is_bmodel;
-			float	 constant_factor = 0.0f, slope_factor = 0.0f;
+			const qboolean is_decal = indirect_draws[i].is_decal;
+			qboolean	   use_zbias = INDIRECT_ZBIAS && gl_zfix.value && indirect_draws[i].is_bmodel && !is_decal;
+			float		   constant_factor = 0.0f, slope_factor = 0.0f;
 			if (use_zbias)
 			{
 				if (vulkan_globals.depth_format == VK_FORMAT_D32_SFLOAT_S8_UINT || vulkan_globals.depth_format == VK_FORMAT_D32_SFLOAT)
@@ -914,6 +1034,11 @@ void R_DrawIndirectBrushes_ShowTris (cb_context_t *cbx)
 		cbx, VK_PIPELINE_BIND_POINT_GRAPHICS,
 		r_showtris.value == 1 ? vulkan_globals.showtris_indirect_pipeline[R_MainPassPipelineVariant (cbx->render_pass_index)]
 							  : vulkan_globals.showtris_indirect_depth_test_pipeline[R_MainPassPipelineVariant (cbx->render_pass_index)]);
+
+	vulkan_globals.vk_cmd_bind_descriptor_sets (
+		cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, vulkan_globals.world_pipeline_layout.handle, 4, 1, &vulkan_globals.bmodel_instances_desc_set, 0, NULL);
+	const uint32_t instance_base = ((uint32_t)bmodel_instances_index * MAX_MODELS) + 1;
+	R_PushConstants (cbx, VK_SHADER_STAGE_ALL_GRAPHICS, 21 * sizeof (float), sizeof (uint32_t), &instance_base);
 
 	VkDeviceSize offset = 0;
 	vulkan_globals.vk_cmd_bind_vertex_buffers (cbx->cb, 0, 1, &bmodel_vertex_buffer, &offset);
@@ -1019,6 +1144,7 @@ static int AllocBlock (int w, int h, int *x, int *y)
 					lightmaps[texnum].workgroup_bounds[i].mins[j] = FLT_MAX;
 					lightmaps[texnum].workgroup_bounds[i].maxs[j] = -FLT_MAX;
 				}
+				lightmaps[texnum].workgroup_bounds[i].submodel = LM_WORKGROUP_SUBMODEL_EMPTY;
 			}
 			for (l = 0; l < LMBLOCK_HEIGHT / LM_CULL_BLOCK_H; l++)
 				for (k = 0; k < LMBLOCK_WIDTH / LM_CULL_BLOCK_W; k++)
@@ -1149,10 +1275,11 @@ R_AssignWorkgroupBounds
 FIXME: This doesn't account for moving bmodels
 ===============
 */
-static void R_AssignWorkgroupBounds (msurface_t *surf)
+static void R_AssignWorkgroupBounds (msurface_t *surf, int submodel)
 {
-	lm_compute_workgroup_bounds_t *bounds = lightmaps[surf->lightmaptexturenum].workgroup_bounds;
-	lm_compute_workgroup_bounds_t *global = &lightmaps[surf->lightmaptexturenum].global_bounds[0][0];
+	struct lightmap_s			  *lm = &lightmaps[surf->lightmaptexturenum];
+	lm_compute_workgroup_bounds_t *bounds = lm->workgroup_bounds;
+	lm_compute_workgroup_bounds_t *global = &lm->global_bounds[0][0];
 	const int					   smax = (surf->extents[0] >> 4) + 1;
 	const int					   tmax = (surf->extents[1] >> 4) + 1;
 
@@ -1185,17 +1312,31 @@ static void R_AssignWorkgroupBounds (msurface_t *surf)
 			const int					   cullblock_x = (surf->light_s + s) / LM_CULL_BLOCK_W;
 			const int					   cullblock_y = (surf->light_t + t) / LM_CULL_BLOCK_H;
 			lm_compute_workgroup_bounds_t *global_bounds = global + cullblock_x + (cullblock_y * (LMBLOCK_WIDTH / LM_CULL_BLOCK_W));
+			// submodel surfaces have model space bounds that the shader transforms with the current entity transform,
+			// a workgroup spanning more than one coordinate space can't be culled with a single AABB
+			if ((workgroup_bounds->submodel == LM_WORKGROUP_SUBMODEL_EMPTY) || (workgroup_bounds->submodel == (uint32_t)submodel))
+				workgroup_bounds->submodel = submodel;
+			else
+				workgroup_bounds->submodel = LM_WORKGROUP_SUBMODEL_MIXED;
 			for (int i = 0; i < 3; ++i)
 			{
 				if (surf_bounds.mins[i] < workgroup_bounds->mins[i])
 					workgroup_bounds->mins[i] = surf_bounds.mins[i];
 				if (surf_bounds.maxs[i] > workgroup_bounds->maxs[i])
 					workgroup_bounds->maxs[i] = surf_bounds.maxs[i];
-				if (surf_bounds.mins[i] < global_bounds->mins[i])
-					global_bounds->mins[i] = surf_bounds.mins[i];
-				if (surf_bounds.maxs[i] > global_bounds->maxs[i])
-					global_bounds->maxs[i] = surf_bounds.maxs[i];
 			}
+			if (submodel == 0)
+			{
+				for (int i = 0; i < 3; ++i)
+				{
+					if (surf_bounds.mins[i] < global_bounds->mins[i])
+						global_bounds->mins[i] = surf_bounds.mins[i];
+					if (surf_bounds.maxs[i] > global_bounds->maxs[i])
+						global_bounds->maxs[i] = surf_bounds.maxs[i];
+				}
+			}
+			else
+				lm->block_has_submodels[cullblock_y][cullblock_x] = true;
 		}
 	}
 }
@@ -1207,36 +1348,44 @@ UpdateIndirectStructs
 */
 static void UpdateIndirectStructs (msurface_t *surf, qboolean is_bmodel)
 {
-	static int last;
-	int		   i;
+	static int	   last;
+	int			   i;
+	const qboolean split_decal = is_bmodel && surf->texinfo->texture->type == TEXTYPE_CUTOUT;
+	const int	   num_draws = split_decal ? 2 : 1;
 	if (last < used_indirect_draws && indirect_draws[last].lightmap_idx == surf->lightmaptexturenum && indirect_draws[last].texture == surf->texinfo->texture &&
-		indirect_draws[last].is_bmodel == is_bmodel)
+		indirect_draws[last].is_bmodel == is_bmodel && !indirect_draws[last].is_decal)
 	{
 		surf->indirect_idx = last;
-		indirect_draws[last].max_indices += 3 * (surf->numedges - 2);
+		for (i = 0; i < num_draws; ++i)
+			indirect_draws[last + i].max_indices += 3 * (surf->numedges - 2);
 		return;
 	}
 	for (i = 0; i < used_indirect_draws; i++)
 	{
 		if (indirect_draws[i].lightmap_idx == surf->lightmaptexturenum && indirect_draws[i].texture == surf->texinfo->texture &&
-			indirect_draws[i].is_bmodel == is_bmodel)
+			indirect_draws[i].is_bmodel == is_bmodel && !indirect_draws[i].is_decal)
 		{
 			surf->indirect_idx = last = i;
-			indirect_draws[i].max_indices += 3 * (surf->numedges - 2);
+			for (int j = 0; j < num_draws; ++j)
+				indirect_draws[i + j].max_indices += 3 * (surf->numedges - 2);
 			return;
 		}
 	}
-	if (i == MAX_INDIRECT_DRAWS - 1)
+	if (used_indirect_draws + num_draws > MAX_INDIRECT_DRAWS)
 	{
 		indirect_ready = false;
 		return;
 	}
-	++used_indirect_draws;
-	surf->indirect_idx = last = i;
-	indirect_draws[i].texture = surf->texinfo->texture;
-	indirect_draws[i].lightmap_idx = surf->lightmaptexturenum;
-	indirect_draws[i].is_bmodel = is_bmodel;
-	indirect_draws[i].max_indices = 3 * (surf->numedges - 2);
+	surf->indirect_idx = last = used_indirect_draws;
+	for (i = 0; i < num_draws; ++i)
+	{
+		indirectdraw_t *draw = &indirect_draws[used_indirect_draws++];
+		draw->texture = surf->texinfo->texture;
+		draw->lightmap_idx = surf->lightmaptexturenum;
+		draw->is_bmodel = is_bmodel;
+		draw->is_decal = split_decal && i == 1;
+		draw->max_indices = 3 * (surf->numedges - 2);
+	}
 }
 
 /*
@@ -1393,18 +1542,26 @@ void R_AllocateLightmapComputeBuffers ()
 {
 	size_t lightstyles_buffer_size = MAX_LIGHTSTYLES * sizeof (float) * 2;
 	size_t lights_buffer_size = MAX_DLIGHTS * 2 * sizeof (lm_compute_light_t) * 2;
+	size_t submodel_transforms_buffer_size = MAX_MODELS * 12 * sizeof (float) * 2;
+	size_t bmodel_instances_buffer_size = MAX_MODELS * sizeof (bmodel_instance_t) * 2;
 
 	Sys_Printf ("Allocating lightstyles buffer (%u KB)\n", (int)lightstyles_buffer_size / 1024);
 	Sys_Printf ("Allocating lights buffer (%u KB)\n", (int)lights_buffer_size / 1024);
+	Sys_Printf ("Allocating submodel transforms buffer (%u KB)\n", (int)submodel_transforms_buffer_size / 1024);
+	Sys_Printf ("Allocating bmodel instances buffer (%u KB)\n", (int)bmodel_instances_buffer_size / 1024);
 
-	buffer_create_info_t buffer_create_infos[2] = {
+	buffer_create_info_t buffer_create_infos[4] = {
 		{&lightstyles_scales_buffer, lightstyles_buffer_size, 0, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, (void **)&lightstyles_scales_buffer_mapped, NULL,
 		 "Lightstyle scales"},
 		{&lights_buffer, lights_buffer_size, 0, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, (void **)&lights_buffer_mapped, NULL, "Lights"},
+		{&submodel_transforms_buffer, submodel_transforms_buffer_size, 0, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, (void **)&submodel_transforms_buffer_mapped, NULL,
+		 "Submodel transforms"},
+		{&bmodel_instances_buffer, bmodel_instances_buffer_size, 0, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, (void **)&bmodel_instances_buffer_mapped, NULL,
+		 "BModel instances"},
 	};
 	R_CreateBuffers (
-		countof (buffer_create_infos), buffer_create_infos, &lights_buffer_memory, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
-		&num_vulkan_bmodel_allocations, "Lights");
+		countof (buffer_create_infos), buffer_create_infos, &frame_upload_buffers_memory, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT,
+		VK_MEMORY_PROPERTY_HOST_CACHED_BIT, &num_vulkan_bmodel_allocations, "Frame upload buffers");
 }
 
 /*
@@ -1435,6 +1592,23 @@ static lm_compute_surface_data_t *GL_AllocateSurfaceDataBuffer ()
 	vkCmdCopyBuffer (command_buffer, staging_buffer, surface_data_buffer, 1, &region);
 
 	return staging_mem;
+}
+
+/*
+==================
+GL_AllocateSurfaceSubmodelsBuffer
+==================
+*/
+static void GL_AllocateSurfaceSubmodelsBuffer ()
+{
+	size_t buffer_size = num_surfaces * sizeof (uint32_t);
+
+	R_FreeBuffer (surface_submodels_buffer, &surface_submodels_buffer_memory, &num_vulkan_bmodel_allocations);
+
+	Sys_Printf ("Allocating surface submodel indices (%u KB)\n", (int)buffer_size / 1024);
+	R_CreateBuffer (
+		&surface_submodels_buffer, &surface_submodels_buffer_memory, buffer_size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+		VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &num_vulkan_bmodel_allocations, NULL, "Surface submodel indices");
 }
 
 /*
@@ -1583,13 +1757,15 @@ static void R_UploadVisibility (byte *data, uint32_t size)
 ===============
 GL_SortSurfaces
 
-Sorts surfs by number of used lightstyles and 3D position, then allocates lm blocks in that order and sets image bounds
+Sorts surfs by number of used lightstyles, submodel and 3D position, then allocates lm blocks in that order and sets image bounds.
+Grouping the surfaces of each movable submodel keeps them out of the lightmap compute workgroups of world surfaces so dlights
+can be culled with a single coordinate space per workgroup
 ===============
 */
 typedef struct
 {
 	msurface_t *surf;
-	unsigned	sortkey;
+	uint64_t	sortkey;
 } surf_sort;
 
 static int prepare_3d_interleave (int x) // bin x..xabcdefghij --> 0000a00b00c00d00e00f00g00h00i00j
@@ -1608,11 +1784,12 @@ static void GL_SortSurfaces (void)
 	msurface_t *surf;
 	TEMP_ALLOC (surf_sort, surfs, num_surfaces * 2);
 	int used_surfs = 0;
-	int sort_bins[4][256];
+	int sort_bins[6][256];
 	memset (sort_bins, 0, sizeof (sort_bins));
 	float scale_x = 500.0f / q_max (1.0f, q_max (fabsf (cl.worldmodel->mins[0]), fabsf (cl.worldmodel->maxs[0])));
 	float scale_y = 500.0f / q_max (1.0f, q_max (fabsf (cl.worldmodel->mins[1]), fabsf (cl.worldmodel->maxs[1])));
 	float scale_z = 500.0f / q_max (1.0f, q_max (fabsf (cl.worldmodel->mins[2]), fabsf (cl.worldmodel->maxs[2])));
+	int	  current_submodel = 0;
 	for (j = 1; j < MAX_MODELS; j++)
 	{
 		qmodel_t *m = cl.model_precache[j];
@@ -1622,6 +1799,13 @@ static void GL_SortSurfaces (void)
 			continue;
 		for (i = 0; i < m->numsurfaces; i++)
 		{
+			int submodel = 0;
+			if (j == 1) // the worldmodel surface array also contains all movable submodel surfaces
+			{
+				while (((current_submodel + 1) < m->numsubmodels) && (i >= m->submodels[current_submodel + 1].firstface))
+					++current_submodel;
+				submodel = q_min (current_submodel, 0xFFFF);
+			}
 			surf = &m->surfaces[i];
 			if (!(surf->flags & SURF_DRAWTILED))
 			{
@@ -1650,16 +1834,14 @@ static void GL_SortSurfaces (void)
 					if (surf->styles[last_lightstyle] == 0xFF)
 						break;
 				surfs[used_surfs].surf = surf;
-				unsigned sortkey = (3 - last_lightstyle) << 30 | z | y << 1 | x << 2;
+				uint64_t sortkey = ((uint64_t)(3 - last_lightstyle) << 46) | ((uint64_t)submodel << 30) | (uint64_t)(z | y << 1 | x << 2);
 				surfs[used_surfs++].sortkey = sortkey;
-				sort_bins[3][(sortkey >> 24) % 256] += 1;
-				sort_bins[2][(sortkey >> 16) % 256] += 1;
-				sort_bins[1][(sortkey >> 8) % 256] += 1;
-				sort_bins[0][(sortkey >> 0) % 256] += 1;
+				for (int pass = 0; pass < 6; ++pass)
+					sort_bins[pass][(sortkey >> (8 * pass)) % 256] += 1;
 			}
 		}
 	}
-	for (int pass = 0; pass < 4; ++pass)
+	for (int pass = 0; pass < 6; ++pass)
 	{
 		surf_sort *from = pass % 2 ? surfs + num_surfaces : surfs;
 		surf_sort *to = pass % 2 ? surfs : surfs + num_surfaces;
@@ -1667,7 +1849,7 @@ static void GL_SortSurfaces (void)
 			sort_bins[pass][i] += sort_bins[pass][i - 1];
 		for (i = used_surfs - 1; i >= 0; --i)
 		{
-			int key = (from[i].sortkey >> 8 * pass) % 256;
+			int key = (from[i].sortkey >> (8 * pass)) % 256;
 			sort_bins[pass][key] -= 1;
 			to[sort_bins[pass][key]] = from[i];
 		}
@@ -1676,7 +1858,7 @@ static void GL_SortSurfaces (void)
 	{
 		surf = surfs[i].surf;
 		surf->lightmaptexturenum = AllocBlock ((surf->extents[0] >> 4) + 1, (surf->extents[1] >> 4) + 1, &surf->light_s, &surf->light_t);
-		for (j = 0; j < (3 - (surfs[i].sortkey >> 30)) + 1; j++)
+		for (j = 0; j < (3 - (unsigned)(surfs[i].sortkey >> 46)) + 1; j++)
 		{
 			unsigned short *w = &lightmaps[surf->lightmaptexturenum].lightstyle_rectused[j].w;
 			unsigned short *h = &lightmaps[surf->lightmaptexturenum].lightstyle_rectused[j].h;
@@ -1729,6 +1911,8 @@ void GL_BuildLightmaps (void)
 	used_deps_data = 0;
 	Mem_Free (brush_deps_data);
 
+	num_worldmodel_submodels = q_min (cl.model_precache[1]->numsubmodels, MAX_MODELS);
+
 	for (i = 1; i < MAX_MODELS; ++i)
 	{
 		qmodel_t *m = cl.model_precache[i];
@@ -1744,10 +1928,14 @@ void GL_BuildLightmaps (void)
 
 	GL_SortSurfaces ();
 
+	GL_AllocateSurfaceSubmodelsBuffer ();
+	TEMP_ALLOC_ZEROED (uint32_t, surface_submodels, num_surfaces);
+
 	surface_data = GL_AllocateSurfaceDataBuffer ();
 
 	R_StagingBeginCopy ();
 	unsigned int varray_index = 0;
+	int			 current_submodel = 0;
 	for (j = 1; j < MAX_MODELS; j++)
 	{
 		qmodel_t *m = cl.model_precache[j];
@@ -1759,14 +1947,23 @@ void GL_BuildLightmaps (void)
 		currentmodel = m;
 		for (i = 0; i < m->numsurfaces; i++)
 		{
+			int submodel = 0;
+			if (j == 1) // the worldmodel surface array also contains all movable submodel surfaces
+			{
+				while (((current_submodel + 1) < m->numsubmodels) && (i >= m->submodels[current_submodel + 1].firstface))
+					++current_submodel;
+				if (current_submodel < num_worldmodel_submodels)
+					submodel = current_submodel;
+			}
 			surf = &m->surfaces[i];
+			surface_submodels[surface_index] = submodel | ((surf->texinfo->texture->type == TEXTYPE_CUTOUT) ? 0x80000000u : 0u);
 			if (!(surf->flags & SURF_DRAWTILED))
 			{
 				const qboolean no_dlights = j > 1;
 				GL_CreateSurfaceLightmap (surf, surface_index | 0x80000000 * no_dlights);
 				BuildSurfaceDisplayList (surf);
 				if (!no_dlights)
-					R_AssignWorkgroupBounds (surf);
+					R_AssignWorkgroupBounds (surf, submodel);
 			}
 			if (indirect_ready)
 				UpdateIndirectStructs (surf, INDIRECT_ZBIAS && surface_index >= indirect_bmodel_start);
@@ -1795,6 +1992,9 @@ void GL_BuildLightmaps (void)
 	}
 
 	R_StagingEndCopy ();
+
+	R_StagingUploadBuffer (surface_submodels_buffer, num_surfaces * sizeof (uint32_t), (byte *)surface_submodels);
+	TEMP_FREE (surface_submodels);
 }
 
 /*
@@ -1844,7 +2044,17 @@ void GL_SetupIndirectDraws ()
 	index_buffer_info.offset = 0;
 	index_buffer_info.range = VK_WHOLE_SIZE;
 
-	ZEROED_STRUCT_ARRAY (VkWriteDescriptorSet, indirect_d, 4);
+	ZEROED_STRUCT (VkDescriptorBufferInfo, indirect_surface_submodels_buffer_info);
+	indirect_surface_submodels_buffer_info.buffer = surface_submodels_buffer;
+	indirect_surface_submodels_buffer_info.offset = 0;
+	indirect_surface_submodels_buffer_info.range = num_surfaces * sizeof (uint32_t);
+
+	ZEROED_STRUCT (VkDescriptorBufferInfo, bmodel_instances_buffer_info);
+	bmodel_instances_buffer_info.buffer = bmodel_instances_buffer;
+	bmodel_instances_buffer_info.offset = 0;
+	bmodel_instances_buffer_info.range = VK_WHOLE_SIZE;
+
+	ZEROED_STRUCT_ARRAY (VkWriteDescriptorSet, indirect_d, 6);
 
 	indirect_d[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 	indirect_d[0].dstBinding = 0;
@@ -1877,6 +2087,22 @@ void GL_SetupIndirectDraws ()
 	indirect_d[3].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 	indirect_d[3].dstSet = vulkan_globals.indirect_compute_desc_set;
 	indirect_d[3].pBufferInfo = &index_buffer_info;
+
+	indirect_d[4].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	indirect_d[4].dstBinding = 4;
+	indirect_d[4].dstArrayElement = 0;
+	indirect_d[4].descriptorCount = 1;
+	indirect_d[4].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	indirect_d[4].dstSet = vulkan_globals.indirect_compute_desc_set;
+	indirect_d[4].pBufferInfo = &indirect_surface_submodels_buffer_info;
+
+	indirect_d[5].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	indirect_d[5].dstBinding = 5;
+	indirect_d[5].dstArrayElement = 0;
+	indirect_d[5].descriptorCount = 1;
+	indirect_d[5].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	indirect_d[5].dstSet = vulkan_globals.indirect_compute_desc_set;
+	indirect_d[5].pBufferInfo = &bmodel_instances_buffer_info;
 
 	vkUpdateDescriptorSets (vulkan_globals.device, countof (indirect_d), indirect_d, 0, NULL);
 
@@ -1955,8 +2181,18 @@ void GL_UpdateLightmapDescriptorSets (void)
 		world_vertex_buffer_info.offset = 0;
 		world_vertex_buffer_info.range = VK_WHOLE_SIZE;
 
+		ZEROED_STRUCT (VkDescriptorBufferInfo, surface_submodels_buffer_info);
+		surface_submodels_buffer_info.buffer = surface_submodels_buffer;
+		surface_submodels_buffer_info.offset = 0;
+		surface_submodels_buffer_info.range = num_surfaces * sizeof (uint32_t);
+
+		ZEROED_STRUCT (VkDescriptorBufferInfo, submodel_transforms_buffer_info);
+		submodel_transforms_buffer_info.buffer = submodel_transforms_buffer;
+		submodel_transforms_buffer_info.offset = 0;
+		submodel_transforms_buffer_info.range = VK_WHOLE_SIZE;
+
 		int num_writes = 0;
-		ZEROED_STRUCT_ARRAY (VkWriteDescriptorSet, writes, 8);
+		ZEROED_STRUCT_ARRAY (VkWriteDescriptorSet, writes, 10);
 		writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
 		writes[0].dstBinding = num_writes++;
 		writes[0].dstArrayElement = 0;
@@ -2020,6 +2256,22 @@ void GL_UpdateLightmapDescriptorSets (void)
 		writes[7].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
 		writes[7].dstSet = lm->descriptor_set;
 		writes[7].pBufferInfo = &world_vertex_buffer_info;
+
+		writes[8].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[8].dstBinding = num_writes++;
+		writes[8].dstArrayElement = 0;
+		writes[8].descriptorCount = 1;
+		writes[8].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[8].dstSet = lm->descriptor_set;
+		writes[8].pBufferInfo = &surface_submodels_buffer_info;
+
+		writes[9].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+		writes[9].dstBinding = num_writes++;
+		writes[9].dstArrayElement = 0;
+		writes[9].descriptorCount = 1;
+		writes[9].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+		writes[9].dstSet = lm->descriptor_set;
+		writes[9].pBufferInfo = &submodel_transforms_buffer_info;
 
 		vkUpdateDescriptorSets (vulkan_globals.device, num_writes, writes, 0, NULL);
 	}
@@ -2109,6 +2361,10 @@ void GL_SetupLightmapCompute (void)
 
 		R_StagingBeginCopy ();
 		memcpy (bounds_staging, lm->workgroup_bounds, WORKGROUP_BOUNDS_BUFFER_SIZE);
+		lm_compute_workgroup_bounds_t *staged_bounds = (lm_compute_workgroup_bounds_t *)bounds_staging;
+		for (int j = 0; j < (LMBLOCK_WIDTH / 8) * (LMBLOCK_HEIGHT / 8); ++j)
+			if (staged_bounds[j].submodel == LM_WORKGROUP_SUBMODEL_EMPTY)
+				staged_bounds[j].submodel = 0; // empty workgroups cull like static world space
 		R_StagingEndCopy ();
 		SAFE_FREE (lm->workgroup_bounds);
 	}
@@ -2139,6 +2395,7 @@ void GL_DeleteBModelVertexBuffer (void)
 {
 	GL_WaitForDeviceIdle ();
 	R_FreeBuffer (bmodel_vertex_buffer, &bmodel_memory, &num_vulkan_bmodel_allocations);
+	R_FreeBuffer (vertex_submodels_buffer, &vertex_submodels_buffer_memory, &num_vulkan_bmodel_allocations);
 }
 
 /*
@@ -2216,7 +2473,9 @@ void GL_BuildBModelVertexBuffer (void)
 	// build vertex array
 	varray_bytes = VERTEXSIZE * sizeof (float) * bmodel_numverts;
 	TEMP_ALLOC_ZEROED (float, varray, varray_bytes / sizeof (float));
+	TEMP_ALLOC_ZEROED (uint32_t, vertex_submodels, bmodel_numverts);
 
+	int current_submodel = 0;
 	for (j = 1; j < MAX_MODELS; j++)
 	{
 		m = cl.model_precache[j];
@@ -2227,6 +2486,17 @@ void GL_BuildBModelVertexBuffer (void)
 		{
 			msurface_t *s = &m->surfaces[i];
 			memcpy (&varray[VERTEXSIZE * s->vbo_firstvert], s->polys->verts, VERTEXSIZE * sizeof (float) * s->numedges);
+
+			uint32_t submodel = 0;
+			if (j == 1) // the worldmodel surface array also contains all movable submodel surfaces
+			{
+				while (((current_submodel + 1) < m->numsubmodels) && (i >= m->submodels[current_submodel + 1].firstface))
+					++current_submodel;
+				if (current_submodel < num_worldmodel_submodels)
+					submodel = current_submodel;
+			}
+			for (int v = 0; v < s->numedges; v++)
+				vertex_submodels[s->vbo_firstvert + v] = submodel;
 		}
 	}
 
@@ -2239,7 +2509,45 @@ void GL_BuildBModelVertexBuffer (void)
 		&bmodel_vertex_buffer, &bmodel_memory, varray_bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &num_vulkan_bmodel_allocations,
 		&bmodel_vertex_buffer_device_address, "BModel vertices");
 	R_StagingUploadBuffer (bmodel_vertex_buffer, varray_bytes, (byte *)varray);
+
+	R_CreateBuffer (
+		&vertex_submodels_buffer, &vertex_submodels_buffer_memory, bmodel_numverts * sizeof (uint32_t),
+		VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, 0, &num_vulkan_bmodel_allocations, NULL,
+		"BModel vertex submodels");
+	R_StagingUploadBuffer (vertex_submodels_buffer, bmodel_numverts * sizeof (uint32_t), (byte *)vertex_submodels);
+	TEMP_FREE (vertex_submodels);
 	TEMP_FREE (varray);
+
+	if (vulkan_globals.bmodel_instances_desc_set != VK_NULL_HANDLE)
+		R_FreeDescriptorSet (vulkan_globals.bmodel_instances_desc_set, &vulkan_globals.bmodel_instances_set_layout);
+	vulkan_globals.bmodel_instances_desc_set = R_AllocateDescriptorSet (&vulkan_globals.bmodel_instances_set_layout);
+
+	ZEROED_STRUCT (VkDescriptorBufferInfo, vertex_submodels_buffer_info);
+	vertex_submodels_buffer_info.buffer = vertex_submodels_buffer;
+	vertex_submodels_buffer_info.offset = 0;
+	vertex_submodels_buffer_info.range = VK_WHOLE_SIZE;
+
+	ZEROED_STRUCT (VkDescriptorBufferInfo, bmodel_instances_buffer_info);
+	bmodel_instances_buffer_info.buffer = bmodel_instances_buffer;
+	bmodel_instances_buffer_info.offset = 0;
+	bmodel_instances_buffer_info.range = VK_WHOLE_SIZE;
+
+	ZEROED_STRUCT_ARRAY (VkWriteDescriptorSet, instance_writes, 2);
+	instance_writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	instance_writes[0].dstBinding = 0;
+	instance_writes[0].dstArrayElement = 0;
+	instance_writes[0].descriptorCount = 1;
+	instance_writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	instance_writes[0].dstSet = vulkan_globals.bmodel_instances_desc_set;
+	instance_writes[0].pBufferInfo = &vertex_submodels_buffer_info;
+	instance_writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+	instance_writes[1].dstBinding = 1;
+	instance_writes[1].dstArrayElement = 0;
+	instance_writes[1].descriptorCount = 1;
+	instance_writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+	instance_writes[1].dstSet = vulkan_globals.bmodel_instances_desc_set;
+	instance_writes[1].pBufferInfo = &bmodel_instances_buffer_info;
+	vkUpdateDescriptorSets (vulkan_globals.device, countof (instance_writes), instance_writes, 0, NULL);
 }
 
 /*
@@ -2755,8 +3063,9 @@ void R_AddDynamicLights (msurface_t *surf)
 		if (!(surf->dlightbits[lnum >> 5] & (1U << (lnum & 31))))
 			continue; // not lit by this light
 
+		// lightmap_dlight_origins holds the light position in the space of the model this surface belongs to
 		rad = cl_dlights[lnum].radius;
-		dist = DotProduct (cl_dlights[lnum].origin, surf->plane->normal) - surf->plane->dist;
+		dist = DotProduct (lightmap_dlight_origins[lnum], surf->plane->normal) - surf->plane->dist;
 		rad -= fabs (dist);
 		minlight = cl_dlights[lnum].minlight;
 		if (rad < minlight)
@@ -2765,7 +3074,7 @@ void R_AddDynamicLights (msurface_t *surf)
 
 		for (i = 0; i < 3; i++)
 		{
-			impact[i] = cl_dlights[lnum].origin[i] - surf->plane->normal[i] * dist;
+			impact[i] = lightmap_dlight_origins[lnum][i] - surf->plane->normal[i] * dist;
 		}
 
 		local[0] = DotProduct (impact, tex->vecs[0]) + tex->vecs[0][3];
@@ -3158,13 +3467,22 @@ void R_FlushUpdateLightmaps (
 							lightmap_regions[j][y + h][i] = false;
 						h += 1;
 					}
-					uint32_t push_constants[7] = {current_dlights, LMBLOCK_WIDTH, x * LM_CULL_BLOCK_W / 8, y * LM_CULL_BLOCK_H / 8, type == 1, cached_dlights};
-					int		 push_size = 6 * sizeof (uint32_t);
+					uint32_t push_constants[12] = {
+						current_dlights,
+						LMBLOCK_WIDTH,
+						x * LM_CULL_BLOCK_W / 8,
+						y * LM_CULL_BLOCK_H / 8,
+						type == 1,
+						cached_dlights,
+						current_compute_buffer_index * MAX_MODELS,
+						(1 - current_compute_buffer_index) * MAX_MODELS};
+					memcpy (&push_constants[8], r_refdef.vieworg, 3 * sizeof (float));
+					int push_size = 11 * sizeof (uint32_t);
 					if (pipeline == &vulkan_globals.update_lightmap_rt_pipeline)
 					{
 						uint32_t shadow_samples = 1 << ((int)r_rtshadows.value + 1);
-						push_constants[6] = shadow_samples;
-						push_size = 7 * sizeof (uint32_t);
+						push_constants[11] = shadow_samples;
+						push_size = 12 * sizeof (uint32_t);
 					}
 					R_PushConstants (cbx, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_size, push_constants);
 					w = q_min (lightmaps[lightmap_indexes[j]].lightstyle_rectused[0].w / 8 - x * LM_CULL_BLOCK_W / 8, w * LM_CULL_BLOCK_W / 8);
@@ -3206,13 +3524,15 @@ static void R_IndirectComputeDispatch (cb_context_t *cbx)
 	vkCmdPipelineBarrier (cbx->cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &memory_barrier, 0, NULL, 0, NULL);
 
 	R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_COMPUTE, vulkan_globals.indirect_draw_pipeline);
-	char push_constants[6 * 4];
+	char push_constants[7 * 4];
 	memcpy (push_constants, &cl.model_precache[1]->numsurfaces, sizeof (int));
 	memset (push_constants + 4, 0, sizeof (uint32_t));
 	uint32_t offset = current_compute_buffer_index * dyn_visibility_offset / 4;
 	memcpy (push_constants + 8, &offset, sizeof (uint32_t));
 	memcpy (push_constants + 12, r_refdef.vieworg, sizeof (vec3_t));
-	R_PushConstants (cbx, VK_SHADER_STAGE_COMPUTE_BIT, 0, 6 * 4, push_constants);
+	const uint32_t instance_base = (uint32_t)bmodel_instances_index * MAX_MODELS;
+	memcpy (push_constants + 24, &instance_base, sizeof (uint32_t));
+	R_PushConstants (cbx, VK_SHADER_STAGE_COMPUTE_BIT, 0, 7 * 4, push_constants);
 	const uint32_t num_workgroups = (cl.worldmodel->numsurfaces + 63) / 64;
 	const uint32_t max_dispatch = vulkan_globals.device_properties.limits.maxComputeWorkGroupCount[0];
 	uint32_t	   start_workgroup = 0;
@@ -3271,11 +3591,51 @@ void R_UpdateLightmapsAndIndirect (void *unused)
 		VectorCopy (cl_dlights[i].origin, light->origin);
 		light->radius = cl_dlights[i].radius;
 		VectorCopy (cl_dlights[i].color, light->color);
-		light->minlight = cl_dlights[i].minlight;
+		// rerelease dynamiclights don't use minlight, so its sign packs the KEX intensity
+		light->minlight = (cl_dlights[i].kex_intensity > 0.0f) ? -cl_dlights[i].kex_intensity : cl_dlights[i].minlight;
+		VectorCopy (cl_dlights[i].cone_dir, light->cone_dir);
+		light->cone_cos = cl_dlights[i].cone_cos;
 		squared_radius[num_used_dlights] = cl_dlights[i].radius * cl_dlights[i].radius;
 		used_dlights[num_used_dlights++] = i;
 	}
 	memcpy (lights_buffer_mapped + (current_compute_buffer_index * MAX_DLIGHTS * 2), cached_dlights, sizeof (lm_compute_light_t) * num_used_dlights);
+
+	// Movable brush submodels are lit in entity space: upload the current model to world transform for each submodel.
+	// The GPU culls dlights against the transformed workgroup bounds, the CPU only schedules updates for the cull
+	// blocks containing submodel surfaces while dlights are active. The transforms are only read while dlight
+	// updates are dispatched, skip all of it when no dlights are active
+	const qboolean any_dlight_updates = (num_used_dlights > 0) || (num_cached_dlights > 0);
+	if (any_dlight_updates)
+	{
+		float *transforms = submodel_transforms_buffer_mapped + ((size_t)current_compute_buffer_index * MAX_MODELS * 12);
+		for (int i = 0; i < num_worldmodel_submodels; ++i)
+		{
+			float *transform_rows = transforms + (i * 12);
+			memset (transform_rows, 0, 12 * sizeof (float));
+			transform_rows[0] = transform_rows[5] = transform_rows[10] = 1.0f;
+		}
+		for (int i = 0; i < cl.num_entities + cl.num_statics; ++i)
+		{
+			entity_t *e = (i < cl.num_entities) ? &cl.entities[i] : cl.static_entities[i - cl.num_entities];
+			if (!e->model || e->model->needload || (e->model->name[0] != '*') || (e->model->surfaces != cl.worldmodel->surfaces))
+				continue;
+			const int submodel = atoi (e->model->name + 1);
+			if ((submodel <= 0) || (submodel >= num_worldmodel_submodels))
+				continue;
+
+			vec3_t angles;
+			VectorCopy (e->angles, angles);
+			angles[0] = -angles[0]; // stupid quake bug
+			float model_matrix[16];
+			IdentityMatrix (model_matrix);
+			R_RotateForEntity (model_matrix, e->origin, angles, e->netstate.scale);
+
+			float *transform_rows = transforms + (submodel * 12);
+			for (int row = 0; row < 3; ++row)
+				for (int col = 0; col < 4; ++col)
+					transform_rows[(row * 4) + col] = model_matrix[(col * 4) + row];
+		}
+	}
 
 	int					 num_lightmaps = 0;
 	int					 num_batch_lightmaps = 0;
@@ -3329,6 +3689,8 @@ void R_UpdateLightmapsAndIndirect (void *unused)
 						needs_update = true;
 					}
 				}
+				if (any_dlight_updates && lm->block_has_submodels[y][x])
+					needs_update = true;
 				if (!needs_update && lm->active_dlights[y][x])
 				{
 					lm->active_dlights[y][x] = false;

@@ -29,18 +29,18 @@ static qboolean textmode;
 cvar_t in_debugkeys = {"in_debugkeys", "0", CVAR_NONE};
 
 // SDL Game Controller cvars
-static cvar_t joy_deadzone_look = {"joy_deadzone_look", "0.175", CVAR_ARCHIVE};
-static cvar_t joy_deadzone_move = {"joy_deadzone_move", "0.175", CVAR_ARCHIVE};
-static cvar_t joy_outer_threshold_look = {"joy_outer_threshold_look", "0.02", CVAR_ARCHIVE};
-static cvar_t joy_outer_threshold_move = {"joy_outer_threshold_move", "0.02", CVAR_ARCHIVE};
-static cvar_t joy_deadzone_trigger = {"joy_deadzone_trigger", "0.2", CVAR_ARCHIVE};
-static cvar_t joy_sensitivity_yaw = {"joy_sensitivity_yaw", "240", CVAR_ARCHIVE};
-static cvar_t joy_sensitivity_pitch = {"joy_sensitivity_pitch", "130", CVAR_ARCHIVE};
-static cvar_t joy_invert = {"joy_invert", "0", CVAR_ARCHIVE};
-static cvar_t joy_exponent = {"joy_exponent", "2", CVAR_ARCHIVE};
-static cvar_t joy_exponent_move = {"joy_exponent_move", "2", CVAR_ARCHIVE};
-static cvar_t joy_swapmovelook = {"joy_swapmovelook", "0", CVAR_ARCHIVE};
-static cvar_t joy_enable = {"joy_enable", "1", CVAR_ARCHIVE};
+static cvar_t joy_deadzone_look = {"joy_deadzone_look", "0.175", CVAR_ARCHIVE_GAME};
+static cvar_t joy_deadzone_move = {"joy_deadzone_move", "0.175", CVAR_ARCHIVE_GAME};
+static cvar_t joy_outer_threshold_look = {"joy_outer_threshold_look", "0.02", CVAR_ARCHIVE_GAME};
+static cvar_t joy_outer_threshold_move = {"joy_outer_threshold_move", "0.02", CVAR_ARCHIVE_GAME};
+static cvar_t joy_deadzone_trigger = {"joy_deadzone_trigger", "0.2", CVAR_ARCHIVE_GAME};
+static cvar_t joy_sensitivity_yaw = {"joy_sensitivity_yaw", "240", CVAR_ARCHIVE_GAME};
+static cvar_t joy_sensitivity_pitch = {"joy_sensitivity_pitch", "130", CVAR_ARCHIVE_GAME};
+static cvar_t joy_invert = {"joy_invert", "0", CVAR_ARCHIVE_GAME};
+static cvar_t joy_exponent = {"joy_exponent", "2", CVAR_ARCHIVE_GAME};
+static cvar_t joy_exponent_move = {"joy_exponent_move", "2", CVAR_ARCHIVE_GAME};
+static cvar_t joy_swapmovelook = {"joy_swapmovelook", "0", CVAR_ARCHIVE_GAME};
+static cvar_t joy_enable = {"joy_enable", "1", CVAR_ARCHIVE_GAME};
 
 #ifdef USE_SDL3
 #define SDL3_GET_WINDOW (SDL_Window *)VID_GetWindow ()
@@ -84,14 +84,14 @@ static cvar_t joy_enable = {"joy_enable", "1", CVAR_ARCHIVE};
 #define SDL_GAMEPAD_BUTTON_LEFT_PADDLE2	  SDL_CONTROLLER_BUTTON_PADDLE4
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD		  SDL_CONTROLLER_BUTTON_TOUCHPAD
 
-#define SDL_EVENT_WINDOW_FOCUS_GAINED SDL_WINDOWEVENT_FOCUS_GAINED
 #define SDL3_GET_WINDOW
 #endif
 
 static qboolean no_mouse = false;
 
-/* total accumulated mouse movement since last frame */
-static int total_dx, total_dy = 0;
+/* total accumulated mouse movement since last frame,
+   float because SDL3 reports relative motion in subpixel precision */
+static float total_dx, total_dy = 0;
 
 void IN_Activate (void)
 {
@@ -141,6 +141,37 @@ void IN_Deactivate (qboolean free_cursor)
 
 	/* discard all mouse events when input is deactivated */
 	IN_BeginIgnoringMouseEvents ();
+}
+
+void IN_DeactivateForConsole (void)
+{
+	IN_Deactivate (true);
+}
+
+void IN_ScaleMouseCoords (float x, float y, int *outx, int *outy)
+{
+	SDL_Window *window = (SDL_Window *)VID_GetWindow ();
+	int			w = 0, h = 0;
+
+	SDL_GetWindowSize (window, &w, &h);
+	if (w > 0 && h > 0)
+	{
+		x = x * vid.width / w;
+		y = y * vid.height / h;
+	}
+	*outx = (int)x;
+	*outy = (int)y;
+}
+
+void IN_GetMousePos (int *outx, int *outy)
+{
+#ifdef USE_SDL3
+	float x, y;
+#else
+	int x, y;
+#endif
+	SDL_GetMouseState (&x, &y);
+	IN_ScaleMouseCoords ((float)x, (float)y, outx, outy);
 }
 
 void IN_HideCursor ()
@@ -205,7 +236,7 @@ extern cvar_t cl_maxpitch; /* johnfitz -- variable pitch clamping */
 extern cvar_t cl_minpitch; /* johnfitz -- variable pitch clamping */
 extern cvar_t scr_fov;
 
-void IN_MouseMotion (int dx, int dy)
+void IN_MouseMotion (float dx, float dy)
 {
 	if (cls.state != ca_connected || cls.signon != SIGNONS || key_dest != key_game || CL_AngleLocked ())
 	{

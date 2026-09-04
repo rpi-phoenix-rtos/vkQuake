@@ -30,9 +30,9 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 // but it differs from other engines and sometimes entities are falling through
 // the world at level start because being misplaced.
 // In such case, disable it (0) to get the same behaviour as QuakeSpasm.
-cvar_t sv_fte_recursivehullckeck = {"sv_fte_recursivehullckeck", "1", CVAR_ARCHIVE};
+cvar_t sv_fte_recursivehullckeck = {"sv_fte_recursivehullckeck", "1", CVAR_ARCHIVE_GAME};
 
-cvar_t sv_fte_createareanode = {"sv_fte_createareanode", "1", CVAR_ARCHIVE};
+cvar_t sv_fte_createareanode = {"sv_fte_createareanode", "1", CVAR_ARCHIVE_GAME};
 
 /*
 
@@ -53,6 +53,67 @@ typedef struct
 	unsigned int hitcontents; // content types to impact upon... (1<<-CONTENTS_FOO) bitmask
 	edict_t		*passedict;
 } moveclip_t;
+
+static qboolean SV_MoveIgnoresEdict (const sv_ignore_edicts_t *ignore_edicts, edict_t *ent)
+{
+	int lo, hi;
+
+	if (!ignore_edicts)
+		return false;
+
+	if (ignore_edicts->pusher == ent)
+		return true;
+
+	lo = 0;
+	hi = ignore_edicts->num_riders - 1;
+	while (lo <= hi)
+	{
+		const int	   mid = lo + (hi - lo) / 2;
+		edict_t *const at = ignore_edicts->riders[mid];
+
+		if (at == ent)
+			return true;
+		if (at < ent)
+			lo = mid + 1;
+		else
+			hi = mid - 1;
+	}
+
+	return false;
+}
+
+static qboolean SV_BoxNodeInPVS (vec3_t mins, vec3_t maxs, byte *pvs, qmodel_t *worldmodel, mnode_t *node)
+{
+	mplane_t *splitplane;
+	mleaf_t	 *leaf;
+	int		  leafnum, sides;
+
+	if (node->contents == CONTENTS_SOLID)
+		return false;
+
+	if (node->contents < 0)
+	{
+		leaf = (mleaf_t *)node;
+		leafnum = leaf - worldmodel->leafs - 1;
+		return pvs[leafnum >> 3] & (1 << (leafnum & 7));
+	}
+
+	splitplane = node->plane;
+	sides = BOX_ON_PLANE_SIDE (mins, maxs, splitplane);
+
+	if (sides & 1 && SV_BoxNodeInPVS (mins, maxs, pvs, worldmodel, node->children[0]))
+		return true;
+
+	if (sides & 2 && SV_BoxNodeInPVS (mins, maxs, pvs, worldmodel, node->children[1]))
+		return true;
+
+	return false;
+}
+
+qboolean SV_BoxInPVS (vec3_t mins, vec3_t maxs, byte *pvs, qmodel_t *worldmodel)
+{
+	return SV_BoxNodeInPVS (mins, maxs, pvs, worldmodel, worldmodel->nodes);
+}
 
 /*
 ===============================================================================
@@ -333,7 +394,7 @@ static void SV_TouchLinks (edict_t *ent)
 	int old_self, old_other;
 	int listcount;
 
-	assert (!ent->free);
+	assert_always (!ent->free);
 
 	// Make a list of edicts num to take less stack space that edict_t*
 	// TODO : can list be a static variable ? SV_TouchLinks is only called from the main thread,
@@ -491,6 +552,8 @@ void SV_LinkEdict (edict_t *ent, qboolean touch_triggers)
 	ent->num_leafs = 0;
 	if (ent->v.modelindex)
 		SV_FindTouchedLeafs (ent, qcvm->worldmodel->nodes);
+
+	SV_PushGridEntityLinked (ent);
 
 	if (ent->v.solid == SOLID_NOT)
 		return;
@@ -989,7 +1052,7 @@ SV_ClipToLinks
 Mins and maxs enclose the entire area swept by the move
 ====================
 */
-static void SV_ClipToLinks (areanode_t *node, moveclip_t *clip)
+static void SV_ClipToLinks (areanode_t *node, moveclip_t *clip, const sv_ignore_edicts_t *ignore_edicts)
 {
 	link_t	*l, *next;
 	edict_t *touch;
@@ -1016,6 +1079,11 @@ static void SV_ClipToLinks (areanode_t *node, moveclip_t *clip)
 
 		if (clip->passedict && clip->passedict->v.size[0] && !touch->v.size[0])
 			continue; // points never interact
+
+		// last, after the cheap rejections: this walks a list, and almost every
+		// edict reaching this loop is discarded by the bbox test above
+		if (SV_MoveIgnoresEdict (ignore_edicts, touch))
+			continue;
 
 		// might intersect, so do an exact clip
 		if (clip->trace.allsolid)
@@ -1067,9 +1135,9 @@ static void SV_ClipToLinks (areanode_t *node, moveclip_t *clip)
 		return;
 
 	if (clip->boxmaxs[node->axis] > node->dist)
-		SV_ClipToLinks (node->children[0], clip);
+		SV_ClipToLinks (node->children[0], clip, ignore_edicts);
 	if (clip->boxmins[node->axis] < node->dist)
-		SV_ClipToLinks (node->children[1], clip);
+		SV_ClipToLinks (node->children[1], clip, ignore_edicts);
 }
 
 static void World_ClipToNetwork (moveclip_t *clip)
@@ -1255,7 +1323,7 @@ boxmaxs[0] = boxmaxs[1] = boxmaxs[2] = 9999;
 SV_Move
 ==================
 */
-trace_t SV_Move (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t end, int type, edict_t *passedict)
+trace_t SV_MoveWithEdictIgnoreMask (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t end, int type, edict_t *passedict, const sv_ignore_edicts_t *ignore_edicts)
 {
 	moveclip_t clip;
 	int		   i;
@@ -1295,10 +1363,18 @@ trace_t SV_Move (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t end, int type, e
 	SV_MoveBounds (start, clip.mins2, clip.maxs2, end, clip.boxmins, clip.boxmaxs);
 
 	// clip to entities
-	SV_ClipToLinks (qcvm->areanodes, &clip);
+	SV_ClipToLinks (qcvm->areanodes, &clip, ignore_edicts);
 
 	if (qcvm == &cl.qcvm)
 		World_ClipToNetwork (&clip);
 
+	if (clip.trace.ent)
+		assert_always (!clip.trace.ent->free);
+
 	return clip.trace;
+}
+
+trace_t SV_Move (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t end, int type, edict_t *passedict)
+{
+	return SV_MoveWithEdictIgnoreMask (start, mins, maxs, end, type, passedict, NULL);
 }

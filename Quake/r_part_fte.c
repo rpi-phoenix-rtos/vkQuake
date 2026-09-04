@@ -28,7 +28,7 @@ The engine has a few builtins.
 
 #include "quakedef.h"
 
-cvar_t r_fteparticles = {"r_fteparticles", "1", CVAR_ARCHIVE};
+cvar_t r_fteparticles = {"r_fteparticles", "1", CVAR_ARCHIVE_GAME};
 
 #ifdef PSET_SCRIPT
 #define USE_DECALS
@@ -549,41 +549,142 @@ static qboolean Q1BSP_RecursiveHullCheck (hull_t *hull, int num, float p1f, floa
 	return Q1BSP_RecursiveHullTrace (&ctx, num, p1f, p2f, p1, p2, trace) != rht_impact;
 }
 
+// bounds are kept separate from the cold rotation data so the cull loop streams a dense array
+typedef struct trace_line_bounds_s
+{
+	vec3_t mins, maxs; // conservative world space bounds for culling
+} trace_line_bounds_t;
+
+typedef struct trace_line_ent_s
+{
+	int		 entnum;
+	qboolean rotated;
+	vec3_t	 axis[3]; // forward/right/up of the entity, matching the renderer's brush model rotation
+} trace_line_ent_t;
+
+static trace_line_bounds_t *trace_line_bounds;
+static trace_line_ent_t	   *trace_line_ents;
+static int					num_trace_line_ents, max_trace_line_ents;
+static int					trace_line_cache_valid_count = -1;
+static int					trace_line_prepared_framecount = -1;
+
+// rebuilds the brush entity list if it is stale and refreshes the per frame entity
+// transforms. Must be called from a single thread before CL_TraceLine can be used
+// concurrently, e.g. by the parallel particle update
+static void CL_PrepareTraceLineEntities (void)
+{
+	int		  i;
+	entity_t *ent;
+
+	if (trace_line_cache_valid_count != r_trace_line_cache_counter)
+	{
+		num_trace_line_ents = 0;
+		for (i = 1; i < cl.num_entities; i++)
+		{
+			ent = &cl.entities[i];
+			if (!ent->model || ent->model->needload || ent->model->type != mod_brush || ent->model == cl.worldmodel)
+				continue;
+			if (num_trace_line_ents == max_trace_line_ents)
+			{
+				max_trace_line_ents = q_max (256, max_trace_line_ents * 2);
+				trace_line_ents = (trace_line_ent_t *)Mem_Realloc (trace_line_ents, max_trace_line_ents * sizeof (trace_line_ent_t));
+				trace_line_bounds = (trace_line_bounds_t *)Mem_Realloc (trace_line_bounds, max_trace_line_ents * sizeof (trace_line_bounds_t));
+			}
+			trace_line_ents[num_trace_line_ents++].entnum = i;
+		}
+		trace_line_cache_valid_count = r_trace_line_cache_counter;
+		trace_line_prepared_framecount = -1;
+	}
+
+	// entity origins and angles change without invalidating the list, refresh once per frame
+	if (trace_line_prepared_framecount == host_framecount)
+		return;
+	trace_line_prepared_framecount = host_framecount;
+
+	for (i = 0; i < num_trace_line_ents; i++)
+	{
+		trace_line_ent_t	*tent = &trace_line_ents[i];
+		trace_line_bounds_t *tbounds = &trace_line_bounds[i];
+		ent = &cl.entities[tent->entnum];
+		tent->rotated = ent->angles[0] || ent->angles[1] || ent->angles[2];
+		if (tent->rotated)
+		{
+			AngleVectors (ent->angles, tent->axis[0], tent->axis[1], tent->axis[2]);
+			// rmins/rmaxs are the radius cube, valid for any rotation
+			VectorAdd (ent->origin, ent->model->rmins, tbounds->mins);
+			VectorAdd (ent->origin, ent->model->rmaxs, tbounds->maxs);
+		}
+		else
+		{
+			VectorAdd (ent->origin, ent->model->mins, tbounds->mins);
+			VectorAdd (ent->origin, ent->model->maxs, tbounds->maxs);
+		}
+	}
+}
+
 float CL_TraceLine (vec3_t start, vec3_t end, vec3_t impact, vec3_t normal, int *entnum)
 { // FIXME: not sure what to do about startsolid.
 	int		  i;
 	trace_t	  trace;
-	float	  frac = 1;
+	float	  frac;
 	entity_t *ent;
 	vec3_t	  relstart, relend;
+	vec3_t	  seg_mins, seg_maxs;
+
 	VectorCopy (end, impact);
 	VectorSet (normal, 0, 0, 1);
-
-	static int num_trace_line_ents;
-	static int trace_line_ents[MAX_EDICTS];
-	static int cache_valid_count = -1;
-	if (cache_valid_count != r_trace_line_cache_counter)
-	{
-		num_trace_line_ents = 0;
-		for (i = 0; i < cl.num_entities; i++)
-		{
-			ent = &cl.entities[i];
-			if (!ent->model || ent->model->needload || ent->model->type != mod_brush)
-				continue;
-			trace_line_ents[num_trace_line_ents++] = i;
-		}
-		cache_valid_count = r_trace_line_cache_counter;
-	}
-
 	if (entnum)
 		*entnum = 0;
+
+	CL_PrepareTraceLineEntities (); // no-op during the parallel particle update, the list is prepared beforehand
+
+	// the world usually clips the line the most, trace it first and only test
+	// brush entities whose bounds overlap the remaining segment
+	memset (&trace, 0, sizeof (trace));
+	trace.fraction = 1;
+	Q1BSP_RecursiveHullCheck (&cl.worldmodel->hulls[0], cl.worldmodel->hulls[0].firstclipnode, 0, 1, start, end, &trace);
+	frac = trace.fraction;
+	if (frac < 1)
+	{
+		VectorCopy (trace.endpos, impact);
+		VectorCopy (trace.plane.normal, normal);
+		if (frac <= 0)
+			return frac;
+	}
+
+	for (i = 0; i < 3; i++)
+	{
+		seg_mins[i] = q_min (start[i], impact[i]) - 1.0f;
+		seg_maxs[i] = q_max (start[i], impact[i]) + 1.0f;
+	}
+
 	for (i = 0; i < num_trace_line_ents; i++)
 	{
-		ent = &cl.entities[trace_line_ents[i]];
+		const trace_line_bounds_t *tbounds = &trace_line_bounds[i];
+		if ((tbounds->mins[0] > seg_maxs[0]) || (tbounds->maxs[0] < seg_mins[0]) || (tbounds->mins[1] > seg_maxs[1]) || (tbounds->maxs[1] < seg_mins[1]) ||
+			(tbounds->mins[2] > seg_maxs[2]) || (tbounds->maxs[2] < seg_mins[2]))
+			continue;
 
-		// FIXME: deal with rotations
-		VectorSubtract (start, ent->origin, relstart);
-		VectorSubtract (end, ent->origin, relend);
+		const trace_line_ent_t *tent = &trace_line_ents[i];
+		ent = &cl.entities[tent->entnum];
+		if (tent->rotated)
+		{
+			// rotate the segment into entity space, matching how the renderer rotates brush models
+			vec3_t temp;
+			VectorSubtract (start, ent->origin, temp);
+			relstart[0] = DotProduct (temp, tent->axis[0]);
+			relstart[1] = -DotProduct (temp, tent->axis[1]);
+			relstart[2] = DotProduct (temp, tent->axis[2]);
+			VectorSubtract (end, ent->origin, temp);
+			relend[0] = DotProduct (temp, tent->axis[0]);
+			relend[1] = -DotProduct (temp, tent->axis[1]);
+			relend[2] = DotProduct (temp, tent->axis[2]);
+		}
+		else
+		{
+			VectorSubtract (start, ent->origin, relstart);
+			VectorSubtract (end, ent->origin, relend);
+		}
 
 		memset (&trace, 0, sizeof (trace));
 		trace.fraction = 1;
@@ -593,14 +694,34 @@ float CL_TraceLine (vec3_t start, vec3_t end, vec3_t impact, vec3_t normal, int 
 		{
 			frac = trace.fraction;
 
-			// FIXME: deal with rotations.
-			VectorAdd (trace.endpos, ent->origin, impact);
-			VectorCopy (trace.plane.normal, normal);
+			if (tent->rotated)
+			{
+				// rotate the impact point and normal back to world space
+				for (int j = 0; j < 3; j++)
+				{
+					impact[j] =
+						ent->origin[j] + (trace.endpos[0] * tent->axis[0][j]) - (trace.endpos[1] * tent->axis[1][j]) + (trace.endpos[2] * tent->axis[2][j]);
+					normal[j] =
+						(trace.plane.normal[0] * tent->axis[0][j]) - (trace.plane.normal[1] * tent->axis[1][j]) + (trace.plane.normal[2] * tent->axis[2][j]);
+				}
+			}
+			else
+			{
+				VectorAdd (trace.endpos, ent->origin, impact);
+				VectorCopy (trace.plane.normal, normal);
+			}
 
 			if (entnum)
-				*entnum = i;
+				*entnum = tent->entnum;
 			if (frac <= 0)
 				break;
+
+			// shrink the segment bounds to the new impact point
+			for (int j = 0; j < 3; j++)
+			{
+				seg_mins[j] = q_min (start[j], impact[j]) - 1.0f;
+				seg_maxs[j] = q_max (start[j], impact[j]) + 1.0f;
+			}
 		}
 	}
 	return frac;
@@ -3315,11 +3436,10 @@ void PScript_RecalculateSkyTris (void)
 						break; // error
 					if (com_token[0] == '}')
 						break; // end of worldspawn
-					if (com_token[0] == '_')
-						strcpy (key, com_token + 1);
-					else
-						strcpy (key, com_token);
-					while (key[strlen (key) - 1] == ' ') // remove trailing spaces
+					const char *key_start = com_token[0] == '_' ? com_token + 1 : com_token;
+					if (q_strlcpy (key, key_start, sizeof (key)) >= sizeof (key))
+						break;
+					while (key[0] && key[strlen (key) - 1] == ' ') // remove trailing spaces
 						key[strlen (key) - 1] = 0;
 					data = COM_Parse (data);
 					if (!data)
@@ -3746,12 +3866,13 @@ static float r_avertexnormals[NUMVERTEXNORMALS][3] = {
 static vec2_t avelocities[NUMVERTEXNORMALS];
 #define BEAMLENGTH 16
 
+static void PScript_QueueDlight (int key, vec3_t org, float radius, float die, float decay, vec3_t rgb); // defined with the deferred queues
+
 static void PScript_EffectSpawned (part_type_t *ptype, vec3_t org, vec3_t axis[3], int dlkey, float countscale)
 {
 	if (ptype->dl_radius[0] || ptype->dl_radius[1]) // && r_rocketlight.value)
 	{
-		float	  radius;
-		dlight_t *dl;
+		float radius;
 
 		static int flickertime;
 		static int flicker;
@@ -3763,13 +3884,22 @@ static void PScript_EffectSpawned (part_type_t *ptype, vec3_t org, vec3_t axis[3
 		}
 		radius = ptype->dl_radius[0] + (r_lightflicker.value ? ((flicker + dlkey * 2000) & 0xffff) * (1.0f / 0xffff) : 0.5) * ptype->dl_radius[1];
 
-		dl = CL_AllocDlight (dlkey);
-		VectorCopy (org, dl->origin);
-		dl->radius = radius;
-		dl->minlight = 0;
-		dl->die = cl.time + ptype->dl_time;
-		dl->decay = ptype->dl_decay[3];
-		VectorCopy (ptype->dl_rgb, dl->color);
+		if (Tasks_IsWorker ())
+		{
+			// the deferred spawn drain runs inside the task graph, concurrently with
+			// tasks that read cl_dlights - queue for PScript_FlushDlightsTask instead
+			PScript_QueueDlight (dlkey, org, radius, cl.time + ptype->dl_time, ptype->dl_decay[3], ptype->dl_rgb);
+		}
+		else
+		{
+			dlight_t *dl = CL_AllocDlight (dlkey);
+			VectorCopy (org, dl->origin);
+			dl->radius = radius;
+			dl->minlight = 0;
+			dl->die = cl.time + ptype->dl_time;
+			dl->decay = ptype->dl_decay[3];
+			VectorCopy (ptype->dl_rgb, dl->color);
+		}
 	}
 	if (ptype->numsounds)
 	{
@@ -5569,13 +5699,10 @@ static void ReallocateIndexBuffer ()
 
 static vec3_t pright, pup;
 
-static void R_AddFanSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
+static void R_EmitFanSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type, unsigned int vertofs, unsigned int idxofs)
 {
 	vec3_t v, cr, o2;
 	float  scale;
-
-	if (cl_numstrisvert + 3 > cl_maxstrisvert[current_buffer_index])
-		ReallocateVertexBuffer ();
 
 	scale = (p->org[0] - r_origin[0]) * vpn[0] + (p->org[1] - r_origin[1]) * vpn[1] + (p->org[2] - r_origin[2]) * vpn[2];
 	scale = (scale * p->scale) * (type->invscalefactor) + p->scale * (type->scalefactor * 250);
@@ -5595,47 +5722,50 @@ static void R_AddFanSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type
 		rgba[1] = p->rgba[1] * a;
 		rgba[2] = p->rgba[2] * a;
 		rgba[3] = (type->premul == 2) ? 0 : a;
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 2].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 1].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 2].color);
 	}
 	else
 	{
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 2].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 1].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 2].color);
 	}
 
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 0].texcoord, p->s1, p->t1);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 1].texcoord, p->s1, p->t2);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 2].texcoord, p->s2, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 0].texcoord, p->s1, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 1].texcoord, p->s1, p->t2);
+	Vector2Set (cl_curstrisvert[vertofs + 2].texcoord, p->s2, p->t1);
 
 	VectorMA (p->org, -scale, p->vel, o2);
 	VectorSubtract (r_refdef.vieworg, o2, v);
 	CrossProduct (v, p->vel, cr);
 	VectorNormalize (cr);
 
-	VectorCopy (p->org, cl_curstrisvert[cl_numstrisvert + 0].position);
-	VectorMA (o2, -p->scale, cr, cl_curstrisvert[cl_numstrisvert + 1].position);
-	VectorMA (o2, p->scale, cr, cl_curstrisvert[cl_numstrisvert + 2].position);
+	VectorCopy (p->org, cl_curstrisvert[vertofs + 0].position);
+	VectorMA (o2, -p->scale, cr, cl_curstrisvert[vertofs + 1].position);
+	VectorMA (o2, p->scale, cr, cl_curstrisvert[vertofs + 2].position);
 
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 0;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 1;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 2;
+}
+
+static void R_AddFanSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
+{
+	if (cl_numstrisvert + 3 > cl_maxstrisvert[current_buffer_index])
+		ReallocateVertexBuffer ();
 	if (cl_numstrisidx + 3 > cl_maxstrisidx[current_buffer_index])
 		ReallocateIndexBuffer ();
-
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 0;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 1;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 2;
-
+	R_EmitFanSparkParticle (t, p, type, cl_numstrisvert, cl_numstrisidx);
 	cl_numstrisvert += 3;
-
+	cl_numstrisidx += 3;
 	t->numvert += 3;
 	t->numidx += 3;
 }
 
-static void R_AddLineSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
+static void R_EmitLineSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type, unsigned int vertofs, unsigned int idxofs)
 {
-	if (cl_numstrisvert + 2 > cl_maxstrisvert[current_buffer_index])
-		ReallocateVertexBuffer ();
 
 	if (type->premul)
 	{
@@ -5644,40 +5774,42 @@ static void R_AddLineSparkParticle (scenetris_t *t, particle_t *p, plooks_t *typ
 		if (a > 1)
 			a = 1;
 		VectorScale (p->rgba, a, scaled_color);
-		Vector3ToColor (scaled_color, cl_curstrisvert[cl_numstrisvert + 0].color);
-		FloatToColor ((type->premul == 2) ? 0 : a, cl_curstrisvert[cl_numstrisvert + 0].color[3]);
-		Vector4Clear (cl_curstrisvert[cl_numstrisvert + 1].color);
+		Vector3ToColor (scaled_color, cl_curstrisvert[vertofs + 0].color);
+		FloatToColor ((type->premul == 2) ? 0 : a, cl_curstrisvert[vertofs + 0].color[3]);
+		Vector4Clear (cl_curstrisvert[vertofs + 1].color);
 	}
 	else
 	{
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector3ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		cl_curstrisvert[cl_numstrisvert + 1].color[3] = 0;
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector3ToColor (p->rgba, cl_curstrisvert[vertofs + 1].color);
+		cl_curstrisvert[vertofs + 1].color[3] = 0;
 	}
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 0].texcoord, p->s1, p->t1);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 1].texcoord, p->s2, p->t2);
+	Vector2Set (cl_curstrisvert[vertofs + 0].texcoord, p->s1, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 1].texcoord, p->s2, p->t2);
 
-	VectorCopy (p->org, cl_curstrisvert[cl_numstrisvert + 0].position);
-	VectorMA (p->org, -1.0 / 10, p->vel, cl_curstrisvert[cl_numstrisvert + 1].position);
+	VectorCopy (p->org, cl_curstrisvert[vertofs + 0].position);
+	VectorMA (p->org, -1.0 / 10, p->vel, cl_curstrisvert[vertofs + 1].position);
 
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 0;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 1;
+}
+
+static void R_AddLineSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
+{
+	if (cl_numstrisvert + 2 > cl_maxstrisvert[current_buffer_index])
+		ReallocateVertexBuffer ();
 	if (cl_numstrisidx + 2 > cl_maxstrisidx[current_buffer_index])
 		ReallocateIndexBuffer ();
-
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 0;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 1;
-
+	R_EmitLineSparkParticle (t, p, type, cl_numstrisvert, cl_numstrisidx);
 	cl_numstrisvert += 2;
-
+	cl_numstrisidx += 2;
 	t->numvert += 2;
 	t->numidx += 2;
 }
 
-static void R_AddTSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
+static void R_EmitTSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type, unsigned int vertofs, unsigned int idxofs)
 {
 	vec3_t v, cr, o2;
-
-	if (cl_numstrisvert + 4 > cl_maxstrisvert[current_buffer_index])
-		ReallocateVertexBuffer ();
 
 	if (type->premul)
 	{
@@ -5689,23 +5821,23 @@ static void R_AddTSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
 		rgba[1] = p->rgba[1] * a;
 		rgba[2] = p->rgba[2] * a;
 		rgba[3] = (type->premul == 2) ? 0 : a;
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 2].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 3].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 1].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 2].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 3].color);
 	}
 	else
 	{
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 2].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 3].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 1].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 2].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 3].color);
 	}
 
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 0].texcoord, p->s1, p->t1);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 1].texcoord, p->s1, p->t2);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 2].texcoord, p->s2, p->t2);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 3].texcoord, p->s2, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 0].texcoord, p->s1, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 1].texcoord, p->s1, p->t2);
+	Vector2Set (cl_curstrisvert[vertofs + 2].texcoord, p->s2, p->t2);
+	Vector2Set (cl_curstrisvert[vertofs + 3].texcoord, p->s2, p->t1);
 
 	{
 		vec3_t movedir;
@@ -5726,8 +5858,8 @@ static void R_AddTSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
 		VectorSubtract (r_refdef.vieworg, o2, v);
 		CrossProduct (v, p->vel, cr);
 		VectorNormalize (cr);
-		VectorMA (o2, -p->scale / 2, cr, cl_curstrisvert[cl_numstrisvert + 0].position);
-		VectorMA (o2, p->scale / 2, cr, cl_curstrisvert[cl_numstrisvert + 1].position);
+		VectorMA (o2, -p->scale / 2, cr, cl_curstrisvert[vertofs + 0].position);
+		VectorMA (o2, p->scale / 2, cr, cl_curstrisvert[vertofs + 1].position);
 
 		VectorMA (p->org, length, movedir, o2);
 	}
@@ -5736,21 +5868,26 @@ static void R_AddTSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
 	CrossProduct (v, p->vel, cr);
 	VectorNormalize (cr);
 
-	VectorMA (o2, p->scale * 0.5, cr, cl_curstrisvert[cl_numstrisvert + 2].position);
-	VectorMA (o2, -p->scale * 0.5, cr, cl_curstrisvert[cl_numstrisvert + 3].position);
+	VectorMA (o2, p->scale * 0.5, cr, cl_curstrisvert[vertofs + 2].position);
+	VectorMA (o2, -p->scale * 0.5, cr, cl_curstrisvert[vertofs + 3].position);
 
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 0;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 1;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 2;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 0;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 2;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 3;
+}
+
+static void R_AddTSparkParticle (scenetris_t *t, particle_t *p, plooks_t *type)
+{
+	if (cl_numstrisvert + 4 > cl_maxstrisvert[current_buffer_index])
+		ReallocateVertexBuffer ();
 	if (cl_numstrisidx + 6 > cl_maxstrisidx[current_buffer_index])
 		ReallocateIndexBuffer ();
-
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 0;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 1;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 2;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 0;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 2;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 3;
-
+	R_EmitTSparkParticle (t, p, type, cl_numstrisvert, cl_numstrisidx);
 	cl_numstrisvert += 4;
-
+	cl_numstrisidx += 6;
 	t->numvert += 4;
 	t->numidx += 6;
 }
@@ -5886,13 +6023,10 @@ static void R_AddClippedDecal (scenetris_t *t, clippeddecal_t *d, plooks_t *type
 	t->numidx += 3;
 }
 
-static void R_AddUnclippedDecal (scenetris_t *t, particle_t *p, plooks_t *type)
+static void R_EmitUnclippedDecal (scenetris_t *t, particle_t *p, plooks_t *type, unsigned int vertofs, unsigned int idxofs)
 {
 	float  x, y;
 	vec3_t sdir, tdir;
-
-	if (cl_numstrisvert + 4 > cl_maxstrisvert[current_buffer_index])
-		ReallocateVertexBuffer ();
 
 	if (type->premul)
 	{
@@ -5904,23 +6038,23 @@ static void R_AddUnclippedDecal (scenetris_t *t, particle_t *p, plooks_t *type)
 		rgba[1] = p->rgba[1] * a;
 		rgba[2] = p->rgba[2] * a;
 		rgba[3] = (type->premul == 2) ? 0 : a;
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 2].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 3].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 1].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 2].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 3].color);
 	}
 	else
 	{
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 2].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 3].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 1].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 2].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 3].color);
 	}
 
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 0].texcoord, p->s1, p->t1);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 1].texcoord, p->s1, p->t2);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 2].texcoord, p->s2, p->t2);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 3].texcoord, p->s2, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 0].texcoord, p->s1, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 1].texcoord, p->s1, p->t2);
+	Vector2Set (cl_curstrisvert[vertofs + 2].texcoord, p->s2, p->t2);
+	Vector2Set (cl_curstrisvert[vertofs + 3].texcoord, p->s2, p->t1);
 
 	//	if (p->vel[1] == 1)
 	{
@@ -5933,49 +6067,51 @@ static void R_AddUnclippedDecal (scenetris_t *t, particle_t *p, plooks_t *type)
 		x = sin (p->angle) * p->scale;
 		y = cos (p->angle) * p->scale;
 
-		cl_curstrisvert[cl_numstrisvert + 0].position[0] = p->org[0] - x * sdir[0] - y * tdir[0];
-		cl_curstrisvert[cl_numstrisvert + 0].position[1] = p->org[1] - x * sdir[1] - y * tdir[1];
-		cl_curstrisvert[cl_numstrisvert + 0].position[2] = p->org[2] - x * sdir[2] - y * tdir[2];
-		cl_curstrisvert[cl_numstrisvert + 1].position[0] = p->org[0] - y * sdir[0] + x * tdir[0];
-		cl_curstrisvert[cl_numstrisvert + 1].position[1] = p->org[1] - y * sdir[1] + x * tdir[1];
-		cl_curstrisvert[cl_numstrisvert + 1].position[2] = p->org[2] - y * sdir[2] + x * tdir[2];
-		cl_curstrisvert[cl_numstrisvert + 2].position[0] = p->org[0] + x * sdir[0] + y * tdir[0];
-		cl_curstrisvert[cl_numstrisvert + 2].position[1] = p->org[1] + x * sdir[1] + y * tdir[1];
-		cl_curstrisvert[cl_numstrisvert + 2].position[2] = p->org[2] + x * sdir[2] + y * tdir[2];
-		cl_curstrisvert[cl_numstrisvert + 3].position[0] = p->org[0] + y * sdir[0] - x * tdir[0];
-		cl_curstrisvert[cl_numstrisvert + 3].position[1] = p->org[1] + y * sdir[1] - x * tdir[1];
-		cl_curstrisvert[cl_numstrisvert + 3].position[2] = p->org[2] + y * sdir[2] - x * tdir[2];
+		cl_curstrisvert[vertofs + 0].position[0] = p->org[0] - x * sdir[0] - y * tdir[0];
+		cl_curstrisvert[vertofs + 0].position[1] = p->org[1] - x * sdir[1] - y * tdir[1];
+		cl_curstrisvert[vertofs + 0].position[2] = p->org[2] - x * sdir[2] - y * tdir[2];
+		cl_curstrisvert[vertofs + 1].position[0] = p->org[0] - y * sdir[0] + x * tdir[0];
+		cl_curstrisvert[vertofs + 1].position[1] = p->org[1] - y * sdir[1] + x * tdir[1];
+		cl_curstrisvert[vertofs + 1].position[2] = p->org[2] - y * sdir[2] + x * tdir[2];
+		cl_curstrisvert[vertofs + 2].position[0] = p->org[0] + x * sdir[0] + y * tdir[0];
+		cl_curstrisvert[vertofs + 2].position[1] = p->org[1] + x * sdir[1] + y * tdir[1];
+		cl_curstrisvert[vertofs + 2].position[2] = p->org[2] + x * sdir[2] + y * tdir[2];
+		cl_curstrisvert[vertofs + 3].position[0] = p->org[0] + y * sdir[0] - x * tdir[0];
+		cl_curstrisvert[vertofs + 3].position[1] = p->org[1] + y * sdir[1] - x * tdir[1];
+		cl_curstrisvert[vertofs + 3].position[2] = p->org[2] + y * sdir[2] - x * tdir[2];
 	}
 	else
 	{
-		VectorMA (p->org, -p->scale, tdir, cl_curstrisvert[cl_numstrisvert + 0].position);
-		VectorMA (p->org, -p->scale, sdir, cl_curstrisvert[cl_numstrisvert + 1].position);
-		VectorMA (p->org, p->scale, tdir, cl_curstrisvert[cl_numstrisvert + 2].position);
-		VectorMA (p->org, p->scale, sdir, cl_curstrisvert[cl_numstrisvert + 3].position);
+		VectorMA (p->org, -p->scale, tdir, cl_curstrisvert[vertofs + 0].position);
+		VectorMA (p->org, -p->scale, sdir, cl_curstrisvert[vertofs + 1].position);
+		VectorMA (p->org, p->scale, tdir, cl_curstrisvert[vertofs + 2].position);
+		VectorMA (p->org, p->scale, sdir, cl_curstrisvert[vertofs + 3].position);
 	}
 
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 0;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 1;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 2;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 0;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 2;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 3;
+}
+
+static void R_AddUnclippedDecal (scenetris_t *t, particle_t *p, plooks_t *type)
+{
+	if (cl_numstrisvert + 4 > cl_maxstrisvert[current_buffer_index])
+		ReallocateVertexBuffer ();
 	if (cl_numstrisidx + 6 > cl_maxstrisidx[current_buffer_index])
 		ReallocateIndexBuffer ();
-
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 0;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 1;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 2;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 0;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 2;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 3;
-
+	R_EmitUnclippedDecal (t, p, type, cl_numstrisvert, cl_numstrisidx);
 	cl_numstrisvert += 4;
-
+	cl_numstrisidx += 6;
 	t->numvert += 4;
 	t->numidx += 6;
 }
 
-static void R_AddTexturedParticle (scenetris_t *t, particle_t *p, plooks_t *type)
+static void R_EmitTexturedParticle (scenetris_t *t, particle_t *p, plooks_t *type, unsigned int vertofs, unsigned int idxofs)
 {
 	float scale, x, y;
-
-	if (cl_numstrisvert + 4 > cl_maxstrisvert[current_buffer_index])
-		ReallocateVertexBuffer ();
 
 	if (type->scalefactor == 1)
 		scale = p->scale * 0.25;
@@ -5999,62 +6135,67 @@ static void R_AddTexturedParticle (scenetris_t *t, particle_t *p, plooks_t *type
 		rgba[1] = p->rgba[1] * a;
 		rgba[2] = p->rgba[2] * a;
 		rgba[3] = (type->premul == 2) ? 0 : a;
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 2].color);
-		Vector4ToColor (rgba, cl_curstrisvert[cl_numstrisvert + 3].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 1].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 2].color);
+		Vector4ToColor (rgba, cl_curstrisvert[vertofs + 3].color);
 	}
 	else
 	{
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 0].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 1].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 2].color);
-		Vector4ToColor (p->rgba, cl_curstrisvert[cl_numstrisvert + 3].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 0].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 1].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 2].color);
+		Vector4ToColor (p->rgba, cl_curstrisvert[vertofs + 3].color);
 	}
 
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 0].texcoord, p->s1, p->t1);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 1].texcoord, p->s1, p->t2);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 2].texcoord, p->s2, p->t2);
-	Vector2Set (cl_curstrisvert[cl_numstrisvert + 3].texcoord, p->s2, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 0].texcoord, p->s1, p->t1);
+	Vector2Set (cl_curstrisvert[vertofs + 1].texcoord, p->s1, p->t2);
+	Vector2Set (cl_curstrisvert[vertofs + 2].texcoord, p->s2, p->t2);
+	Vector2Set (cl_curstrisvert[vertofs + 3].texcoord, p->s2, p->t1);
 
 	if (p->angle)
 	{
 		x = sin (p->angle) * scale;
 		y = cos (p->angle) * scale;
 
-		cl_curstrisvert[cl_numstrisvert + 0].position[0] = p->org[0] - x * pright[0] - y * pup[0];
-		cl_curstrisvert[cl_numstrisvert + 0].position[1] = p->org[1] - x * pright[1] - y * pup[1];
-		cl_curstrisvert[cl_numstrisvert + 0].position[2] = p->org[2] - x * pright[2] - y * pup[2];
-		cl_curstrisvert[cl_numstrisvert + 1].position[0] = p->org[0] - y * pright[0] + x * pup[0];
-		cl_curstrisvert[cl_numstrisvert + 1].position[1] = p->org[1] - y * pright[1] + x * pup[1];
-		cl_curstrisvert[cl_numstrisvert + 1].position[2] = p->org[2] - y * pright[2] + x * pup[2];
-		cl_curstrisvert[cl_numstrisvert + 2].position[0] = p->org[0] + x * pright[0] + y * pup[0];
-		cl_curstrisvert[cl_numstrisvert + 2].position[1] = p->org[1] + x * pright[1] + y * pup[1];
-		cl_curstrisvert[cl_numstrisvert + 2].position[2] = p->org[2] + x * pright[2] + y * pup[2];
-		cl_curstrisvert[cl_numstrisvert + 3].position[0] = p->org[0] + y * pright[0] - x * pup[0];
-		cl_curstrisvert[cl_numstrisvert + 3].position[1] = p->org[1] + y * pright[1] - x * pup[1];
-		cl_curstrisvert[cl_numstrisvert + 3].position[2] = p->org[2] + y * pright[2] - x * pup[2];
+		cl_curstrisvert[vertofs + 0].position[0] = p->org[0] - x * pright[0] - y * pup[0];
+		cl_curstrisvert[vertofs + 0].position[1] = p->org[1] - x * pright[1] - y * pup[1];
+		cl_curstrisvert[vertofs + 0].position[2] = p->org[2] - x * pright[2] - y * pup[2];
+		cl_curstrisvert[vertofs + 1].position[0] = p->org[0] - y * pright[0] + x * pup[0];
+		cl_curstrisvert[vertofs + 1].position[1] = p->org[1] - y * pright[1] + x * pup[1];
+		cl_curstrisvert[vertofs + 1].position[2] = p->org[2] - y * pright[2] + x * pup[2];
+		cl_curstrisvert[vertofs + 2].position[0] = p->org[0] + x * pright[0] + y * pup[0];
+		cl_curstrisvert[vertofs + 2].position[1] = p->org[1] + x * pright[1] + y * pup[1];
+		cl_curstrisvert[vertofs + 2].position[2] = p->org[2] + x * pright[2] + y * pup[2];
+		cl_curstrisvert[vertofs + 3].position[0] = p->org[0] + y * pright[0] - x * pup[0];
+		cl_curstrisvert[vertofs + 3].position[1] = p->org[1] + y * pright[1] - x * pup[1];
+		cl_curstrisvert[vertofs + 3].position[2] = p->org[2] + y * pright[2] - x * pup[2];
 	}
 	else
 	{
-		VectorMA (p->org, -scale, pup, cl_curstrisvert[cl_numstrisvert + 0].position);
-		VectorMA (p->org, -scale, pright, cl_curstrisvert[cl_numstrisvert + 1].position);
-		VectorMA (p->org, scale, pup, cl_curstrisvert[cl_numstrisvert + 2].position);
-		VectorMA (p->org, scale, pright, cl_curstrisvert[cl_numstrisvert + 3].position);
+		VectorMA (p->org, -scale, pup, cl_curstrisvert[vertofs + 0].position);
+		VectorMA (p->org, -scale, pright, cl_curstrisvert[vertofs + 1].position);
+		VectorMA (p->org, scale, pup, cl_curstrisvert[vertofs + 2].position);
+		VectorMA (p->org, scale, pright, cl_curstrisvert[vertofs + 3].position);
 	}
 
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 0;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 1;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 2;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 0;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 2;
+	cl_curstrisidx[idxofs++] = (vertofs - t->firstvert) + 3;
+}
+
+static void R_AddTexturedParticle (scenetris_t *t, particle_t *p, plooks_t *type)
+{
+	if (cl_numstrisvert + 4 > cl_maxstrisvert[current_buffer_index])
+		ReallocateVertexBuffer ();
 	if (cl_numstrisidx + 6 > cl_maxstrisidx[current_buffer_index])
 		ReallocateIndexBuffer ();
-
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 0;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 1;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 2;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 0;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 2;
-	cl_curstrisidx[cl_numstrisidx++] = (cl_numstrisvert - t->firstvert) + 3;
-
+	R_EmitTexturedParticle (t, p, type, cl_numstrisvert, cl_numstrisidx);
 	cl_numstrisvert += 4;
-
+	cl_numstrisidx += 6;
 	t->numvert += 4;
 	t->numidx += 6;
 }
@@ -6067,7 +6208,6 @@ static void PScript_DrawParticleBatches (cb_context_t *cbx, qboolean draw_oit_ba
 		return;
 
 	R_BeginDebugUtilsLabel (cbx, draw_oit_batches ? "FTE Particles OIT" : "FTE Particles");
-	Fog_DisableGFog (cbx);
 
 	for (o = 0; o < 3; o++)
 	{
@@ -6086,11 +6226,14 @@ static void PScript_DrawParticleBatches (cb_context_t *cbx, qboolean draw_oit_ba
 			if (tris->numidx == 0)
 				continue;
 
-			const int				pipeline_index = blend_mode + (draw_lines ? 8 : 0);
-			const vulkan_pipeline_t pipeline = draw_oit_batches
-												   ? vulkan_globals.fte_particle_wboit_pipelines[pipeline_index]
-												   : vulkan_globals.fte_particle_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index];
+			const int						 pipeline_index = blend_mode + (draw_lines ? 8 : 0);
+			const main_render_pass_variant_t main_pass_variant = R_MainPassPipelineVariant (cbx->render_pass_index);
+			const vulkan_pipeline_t			 pipeline = draw_oit_batches	? vulkan_globals.fte_particle_wboit_pipelines[pipeline_index]
+														: cbx->subpass != 0 ? vulkan_globals.fte_particle_post_oit_pipelines[main_pass_variant][pipeline_index]
+																			: vulkan_globals.fte_particle_pipelines[main_pass_variant][pipeline_index];
 			R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+			R_PushConstants (cbx, VK_SHADER_STAGE_ALL_GRAPHICS, 0, 16 * sizeof (float), vulkan_globals.view_projection_matrix);
+			Fog_DisableGFog (cbx);
 			gltexture_t *tex = (tris->beflags & BEF_LINES) ? whitetexture : tris->texture;
 
 			const int		   num_indices = tris->numidx;
@@ -6104,32 +6247,376 @@ static void PScript_DrawParticleBatches (cb_context_t *cbx, qboolean draw_oit_ba
 	R_EndDebugUtilsLabel (cbx);
 }
 
-static void PScript_UpdateParticleTypes (float pframetime)
+// Deferred spawns and the flat update list decouple the per particle update from the
+// per type linked lists: the update never mutates any list and never spawns into other
+// types, so it only touches the particle itself and can eventually run in parallel
+typedef struct deferred_effect_s
 {
-	void (*bdraw) (scenetris_t *t, beamseg_t *p, plooks_t *type);
-	void (*tdraw) (scenetris_t *t, particle_t *p, plooks_t *type);
+	vec3_t org;
+	vec3_t dir;
+	float  count;
+	int	   type;
+} deferred_effect_t;
 
-	vec3_t			oldorg;
-	vec3_t			stop, normal;
-	part_type_t	   *type, *lastvalidtype;
-	particle_t	   *p, *kill;
-	clippeddecal_t *d, *dkill;
-	ramp_t		   *ramp;
-	float			grav;
-	vec3_t			friction;
-	scenetris_t	   *scenetri;
-	float			dist;
-	particle_t	   *kill_list, *kill_first; // the kill list is to stop particles from being freed and reused whilst still in this loop
-											// which is bad because beams need to find out when particles died. Reuse can do wierd things.
-											// remember that they're not drawn instantly either.
-	beamseg_t	   *b, *bkill;
+typedef struct deferred_trail_s
+{
+	vec3_t		   start;
+	vec3_t		   end;
+	int			   type;
+	trailstate_t **tsk;
+} deferred_trail_t;
 
-	int			 traces = r_particle_tracelimit.value;
-	int			 rampind;
+typedef struct deferred_decal_s
+{
+	part_type_t *type;
+	int			 entity;
+	vec3_t		 center;
+	vec3_t		 normal;
+	float		 scale;
+} deferred_decal_t;
+
+typedef struct deferred_dlight_s
+{
+	int	   key;
+	vec3_t org;
+	float  radius;
+	float  die;
+	float  decay;
+	vec3_t rgb;
+} deferred_dlight_t;
+
+typedef struct particle_update_s
+{
+	particle_t	*p;
+	part_type_t *type;
+} particle_update_t;
+
+#define DEFERRED_PUSH(array, num, max, elemtype)                                  \
+	do                                                                            \
+	{                                                                             \
+		if ((num) == (max))                                                       \
+		{                                                                         \
+			(max) = q_max (256, (max) * 2);                                       \
+			(array) = (elemtype *)Mem_Realloc (array, (max) * sizeof (elemtype)); \
+		}                                                                         \
+	} while (false)
+
+// each task worker queues into its own arrays so the parallel update never contends
+typedef struct deferred_queues_s
+{
+	deferred_effect_t *effects;
+	int				   num_effects, max_effects;
+	deferred_trail_t  *trails;
+	int				   num_trails, max_trails;
+	deferred_decal_t  *decals;
+	int				   num_decals, max_decals;
+	deferred_dlight_t *dlights;
+	int				   num_dlights, max_dlights;
+} deferred_queues_t;
+
+static deferred_queues_t  deferred_queues[TASKS_MAX_WORKERS];
+static particle_update_t *particle_updates;
+static int				  num_particle_updates, max_particle_updates;
+static atomic_uint32_t	  particle_traces_used;
+static uint32_t			  particle_trace_limit;
+static uint32_t			  particle_update_seed;
+
+static void PScript_QueueEffect (vec3_t org, vec3_t dir, float count, int type)
+{
+	deferred_queues_t *queue = &deferred_queues[Tasks_GetWorkerIndex ()];
+	DEFERRED_PUSH (queue->effects, queue->num_effects, queue->max_effects, deferred_effect_t);
+	deferred_effect_t *fx = &queue->effects[queue->num_effects++];
+	VectorCopy (org, fx->org);
+	VectorCopy (dir, fx->dir);
+	fx->count = count;
+	fx->type = type;
+}
+
+static void PScript_QueueTrail (vec3_t start, vec3_t end, int type, trailstate_t **tsk)
+{
+	deferred_queues_t *queue = &deferred_queues[Tasks_GetWorkerIndex ()];
+	DEFERRED_PUSH (queue->trails, queue->num_trails, queue->max_trails, deferred_trail_t);
+	deferred_trail_t *trail = &queue->trails[queue->num_trails++];
+	VectorCopy (start, trail->start);
+	VectorCopy (end, trail->end);
+	trail->type = type;
+	trail->tsk = tsk;
+}
+
+static void PScript_QueueDecal (part_type_t *type, int entity, vec3_t center, vec3_t normal, float scale)
+{
+	deferred_queues_t *queue = &deferred_queues[Tasks_GetWorkerIndex ()];
+	DEFERRED_PUSH (queue->decals, queue->num_decals, queue->max_decals, deferred_decal_t);
+	deferred_decal_t *decal = &queue->decals[queue->num_decals++];
+	decal->type = type;
+	decal->entity = entity;
+	VectorCopy (center, decal->center);
+	VectorCopy (normal, decal->normal);
+	decal->scale = scale;
+}
+
+static void PScript_QueueDlight (int key, vec3_t org, float radius, float die, float decay, vec3_t rgb)
+{
+	deferred_queues_t *queue = &deferred_queues[Tasks_GetWorkerIndex ()];
+	DEFERRED_PUSH (queue->dlights, queue->num_dlights, queue->max_dlights, deferred_dlight_t);
+	deferred_dlight_t *dl = &queue->dlights[queue->num_dlights++];
+	dl->key = key;
+	VectorCopy (org, dl->org);
+	dl->radius = radius;
+	dl->die = die;
+	dl->decay = decay;
+	VectorCopy (rgb, dl->rgb);
+}
+
+/*
+===============
+PScript_FlushDlightsTask
+
+Allocates the dlights queued by the previous frame's deferred effect spawns
+(which run inside the task graph, where writing cl_dlights would race with
+the tasks reading them). Scheduled at the start of the graph, before anything
+reads cl_dlights and before the next layout task refills the queues.
+===============
+*/
+void PScript_FlushDlightsTask (void *unused)
+{
+	for (int w = 0; w < TASKS_MAX_WORKERS; w++)
+	{
+		deferred_queues_t *queue = &deferred_queues[w];
+		for (int i = 0; i < queue->num_dlights; i++)
+		{
+			deferred_dlight_t *qdl = &queue->dlights[i];
+			if (qdl->die < cl.time)
+				continue;
+			dlight_t *dl = CL_AllocDlight (qdl->key);
+			VectorCopy (qdl->org, dl->origin);
+			dl->radius = qdl->radius;
+			dl->minlight = 0;
+			dl->die = qdl->die;
+			dl->decay = qdl->decay;
+			VectorCopy (qdl->rgb, dl->color);
+		}
+		queue->num_dlights = 0;
+	}
+}
+
+// small local RNG so the parallel update doesn't contend on (or require thread safety of) COM_Rand
+static inline uint32_t P_UpdateRand (uint32_t *state)
+{
+	uint32_t x = *state;
+	x ^= x << 13;
+	x ^= x >> 17;
+	x ^= x << 5;
+	*state = x;
+	return x;
+}
+#define ufrandom(rng) (P_UpdateRand (rng) * (1.0f / 4294967296.0f))
+#define ucrandom(rng) (P_UpdateRand (rng) * (2.0f / 4294967296.0f) - 1.0f)
+
+// per type draw metadata: every draw function emits a fixed number of vertices/indices
+// per particle, so the serial layout pass only reserves ranges and the vertices are
+// written in parallel by PScript_EmitParticlesTask with pure arithmetic addressing
+typedef struct particle_emit_meta_s
+{
+	int start, count;  // contiguous segment of this type's particles in particle_updates
+	int first_stri;	   // first of the consecutive batches reserved for this type
+	int vpp, ipp, ppb; // vertices/indices per particle, particles per batch
+	void (*emit_core) (scenetris_t *t, particle_t *p, plooks_t *type, unsigned int vertofs, unsigned int idxofs);
+} particle_emit_meta_t;
+
+static particle_emit_meta_t *type_emit_meta;
+static int					 num_type_emit_meta;
+
+/*
+===============
+PScript_UpdateParticle
+
+Advances a single live particle: physics, color/scale ramps, emission and BSP
+collision. Only mutates the particle itself, everything else goes through the
+deferred queues
+===============
+*/
+static void PScript_UpdateParticle (particle_t *p, part_type_t *type, float pframetime, qboolean doflurry, uint32_t *rng)
+{
+	vec3_t	oldorg, stop, normal;
+	vec3_t	friction;
+	float	dist;
+	ramp_t *ramp;
+	int		rampind;
+
+	const float grav = type->gravity * pframetime;
+	friction[0] = 1 - type->friction[0] * pframetime;
+	friction[1] = 1 - type->friction[1] * pframetime;
+	friction[2] = 1 - type->friction[2] * pframetime;
+
+	VectorCopy (p->org, oldorg);
+	if (type->flags & PT_VELOCITY)
+	{
+		p->org[0] += p->vel[0] * pframetime;
+		p->org[1] += p->vel[1] * pframetime;
+		p->org[2] += p->vel[2] * pframetime;
+		p->vel[2] -= grav;
+		if (type->flags & PT_FRICTION)
+		{
+			p->vel[0] *= friction[0];
+			p->vel[1] *= friction[1];
+			p->vel[2] *= friction[2];
+		}
+		if (type->flurry && doflurry)
+		{ // these should probably be partially synced,
+			p->vel[0] += ucrandom (rng) * type->flurry;
+			p->vel[1] += ucrandom (rng) * type->flurry;
+		}
+	}
+
+	p->angle += p->rotationspeed * pframetime;
+
+	switch (type->rampmode)
+	{
+	case RAMP_NEAREST:
+		rampind = (int)(type->rampindexes * (type->die - (p->die - particletime)) / type->die);
+		if (rampind >= type->rampindexes)
+			rampind = type->rampindexes - 1;
+		ramp = type->ramp + rampind;
+		VectorCopy (ramp->rgb, p->rgba);
+		p->rgba[3] = ramp->alpha;
+		p->scale = ramp->scale;
+		break;
+	case RAMP_LERP:
+	{
+		float frac = (type->rampindexes * (type->die - (p->die - particletime)) / type->die);
+		int	  s1, s2;
+		s1 = frac;
+		s2 = s1 + 1;
+		if (s1 > type->rampindexes - 1)
+			s1 = type->rampindexes - 1;
+		if (s2 > type->rampindexes - 1)
+			s2 = type->rampindexes - 1;
+		frac -= s1;
+		VectorInterpolate (type->ramp[s1].rgb, frac, type->ramp[s2].rgb, p->rgba);
+		FloatInterpolate (type->ramp[s1].alpha, frac, type->ramp[s2].alpha, p->rgba[3]);
+		FloatInterpolate (type->ramp[s1].scale, frac, type->ramp[s2].scale, p->scale);
+	}
+	break;
+	case RAMP_DELTA: // particle ramps
+		rampind = (int)(type->rampindexes * (type->die - (p->die - particletime)) / type->die);
+		if (rampind >= type->rampindexes)
+			rampind = type->rampindexes - 1;
+		ramp = type->ramp + rampind;
+		VectorMA (p->rgba, pframetime, ramp->rgb, p->rgba);
+		p->rgba[3] -= pframetime * ramp->alpha;
+		p->scale += pframetime * ramp->scale;
+		break;
+	case RAMP_NONE: // particle changes acording to it's preset properties.
+		if (particletime < (p->die - type->die + type->rgbchangetime))
+		{
+			p->rgba[0] += pframetime * type->rgbchange[0];
+			p->rgba[1] += pframetime * type->rgbchange[1];
+			p->rgba[2] += pframetime * type->rgbchange[2];
+		}
+		p->rgba[3] += pframetime * type->alphachange;
+		p->scale += pframetime * type->scaledelta;
+	}
+
+	if (type->emit >= 0)
+	{
+		if (type->emittime < 0)
+			PScript_QueueTrail (oldorg, p->org, type->emit, &p->state.trailstate);
+		else if (p->state.nextemit < particletime)
+		{
+			p->state.nextemit = particletime + type->emittime + ufrandom (rng) * type->emitrand;
+			PScript_QueueEffect (p->org, p->vel, 1, type->emit);
+		}
+	}
+
+	if (type->cliptype >= 0 && r_bouncysparks.value)
+	{
+		VectorSubtract (p->org, p->oldorg, stop);
+		if (!type->clipbounce || DotProduct (stop, stop) > 10 * 10)
+		{
+			int e;
+			if ((Atomic_IncrementUInt32 (&particle_traces_used) < particle_trace_limit) && CL_TraceLine (p->oldorg, p->org, stop, normal, &e) < 1)
+			{
+				if (type->clipbounce < 0)
+				{
+					p->die = -1;
+#ifdef USE_DECALS
+					if (type->clipbounce == -2)
+					{ // this type of particle splatters itself as a decal when it hits a wall.
+						PScript_QueueDecal (type, e, p->org, normal, p->scale);
+					}
+#endif
+					return;
+				}
+				else if (part_type + type->cliptype == type)
+				{										// bounce
+					dist = DotProduct (p->vel, normal); // * (-1-(rand()/(float)0x7fff)/2);
+					dist *= -type->clipbounce;
+					VectorMA (p->vel, dist, normal, p->vel);
+					VectorCopy (stop, p->org);
+
+					if (!*type->texname && VectorLength (p->vel) < 1000 * pframetime && type->looks.type == PT_NORMAL)
+					{
+						p->die = -1;
+						return;
+					}
+				}
+				else
+				{
+					p->die = -1;
+					VectorNormalize (p->vel);
+
+					if (type->clipbounce)
+					{
+						VectorScale (normal, type->clipbounce, normal);
+						PScript_QueueEffect (stop, normal, type->clipcount / part_type[type->cliptype].count, type->cliptype);
+					}
+					else
+						PScript_QueueEffect (stop, p->vel, type->clipcount / part_type[type->cliptype].count, type->cliptype);
+					return;
+				}
+			}
+			VectorCopy (p->org, p->oldorg);
+		}
+	}
+}
+
+#define PARTICLE_UPDATE_CHUNK_SIZE 1024
+
+static float	   p_frametime;
+static qboolean	   p_doflurry;
+static particle_t *p_kill_list, *p_kill_first; // the kill list is to stop particles from being freed and reused whilst still in this frame
+											   // which is bad because beams need to find out when particles died. Reuse can do wierd things.
+											   // remember that they're not drawn instantly either.
+
+/*
+===============
+PScript_UpdateParticlesSetupTask
+
+Serial preparation for the particle update: advances the frame time, spawns rain,
+unlinks expired particles and flattens the live ones into the update array
+===============
+*/
+void PScript_UpdateParticlesSetupTask (void *unused)
+{
+	static float oldtime;
 	static float flurrytime;
-	qboolean	 doflurry;
-	int			 batchflags;
+	part_type_t *type;
+	particle_t	*p, *kill;
 	unsigned int i;
+
+	p_frametime = cl.time - oldtime;
+	if (p_frametime < 0)
+		p_frametime = 0;
+	if (p_frametime > 1)
+		p_frametime = 1;
+	oldtime = cl.time;
+
+	num_particle_updates = 0;
+	p_kill_list = p_kill_first = NULL;
+
+	if (!r_particles.value)
+		return;
 
 	if (r_plooksdirty)
 	{
@@ -6161,16 +6648,14 @@ static void PScript_UpdateParticleTypes (float pframetime)
 	VectorScale (vup, 1.5, pup);
 	VectorScale (vright, 1.5, pright);
 
-	kill_list = kill_first = NULL;
-
-	flurrytime -= pframetime;
+	flurrytime -= p_frametime;
 	if (flurrytime < 0)
 	{
-		doflurry = true;
+		p_doflurry = true;
 		flurrytime = 0.1 + frandom () * 0.3;
 	}
 	else
-		doflurry = false;
+		p_doflurry = false;
 
 	if (!free_decals)
 	{
@@ -6192,6 +6677,130 @@ static void PScript_UpdateParticleTypes (float pframetime)
 				r_particlerecycle = 0;
 		}
 	}
+
+	if (r_part_rain.value && r_fteparticles.value)
+	{
+		entity_t *ent;
+		vec3_t	  axis[3];
+		int		  j;
+		for (j = 0; j < cl.num_entities; j++)
+		{
+			ent = &cl.entities[j];
+			if (!ent->model || ent->model->needload)
+				continue;
+			if (!ent->model->skytris)
+				continue;
+			AngleVectors (ent->angles, axis[0], axis[1], axis[2]);
+			// this timer, as well as the per-tri timer, are unable to deal with certain rates+sizes. it would be good to fix that...
+			// it would also be nice to do mdls too...
+			P_AddRainParticles (ent->model, axis, ent->origin, p_frametime);
+		}
+	}
+
+	if (num_type_emit_meta != numparticletypes)
+	{
+		type_emit_meta = (particle_emit_meta_t *)Mem_Realloc (type_emit_meta, sizeof (particle_emit_meta_t) * numparticletypes);
+		num_type_emit_meta = numparticletypes;
+	}
+	memset (type_emit_meta, 0, sizeof (particle_emit_meta_t) * numparticletypes);
+
+	// walk the lists once to unlink expired particles and flatten the live ones, so the
+	// update runs over a plain array without touching any list structure
+	for (type = part_run_list; type != NULL; type = type->nexttorun)
+	{
+		particle_emit_meta_t *meta = &type_emit_meta[type - part_type];
+		meta->start = num_particle_updates;
+
+		if (!type->die)
+			continue; // types without a lifetime are drained during drawing
+
+		for (;;)
+		{
+			kill = type->particles;
+			if (kill && kill->die < particletime)
+			{
+				if (type->emittime < 0)
+					PScript_DelinkTrailstate (&kill->state.trailstate);
+				type->particles = kill->next;
+				kill->next = p_kill_list;
+				p_kill_list = kill;
+				if (!p_kill_first)
+					p_kill_first = kill;
+				continue;
+			}
+			break;
+		}
+		for (p = type->particles; p; p = p->next)
+		{
+			for (;;)
+			{
+				kill = p->next;
+				if (kill && kill->die < particletime)
+				{
+					if (type->emittime < 0)
+						PScript_DelinkTrailstate (&kill->state.trailstate);
+					p->next = kill->next;
+					kill->next = p_kill_list;
+					p_kill_list = kill;
+					if (!p_kill_first)
+						p_kill_first = kill;
+					continue;
+				}
+				break;
+			}
+			DEFERRED_PUSH (particle_updates, num_particle_updates, max_particle_updates, particle_update_t);
+			particle_updates[num_particle_updates].p = p;
+			particle_updates[num_particle_updates].type = type;
+			++num_particle_updates;
+		}
+		meta->count = num_particle_updates - meta->start;
+	}
+
+	particle_trace_limit = q_max ((int)r_particle_tracelimit.value, 0);
+	Atomic_StoreUInt32 (&particle_traces_used, 0);
+	particle_update_seed = COM_Rand ();
+	CL_PrepareTraceLineEntities ();
+}
+
+/*
+===============
+PScript_UpdateParticlesTask
+
+Indexed over the worker count: pure particle local work plus read only BSP traces.
+Each index updates an interleaved set of chunks so uneven trace costs still balance
+===============
+*/
+void PScript_UpdateParticlesTask (int index, void *unused)
+{
+	const int stride = q_max (Tasks_NumWorkers (), 1) * PARTICLE_UPDATE_CHUNK_SIZE;
+	uint32_t  rng = (particle_update_seed ^ ((uint32_t)index * 2654435761u)) | 1;
+	for (int start = index * PARTICLE_UPDATE_CHUNK_SIZE; start < num_particle_updates; start += stride)
+	{
+		const int end = q_min (start + PARTICLE_UPDATE_CHUNK_SIZE, num_particle_updates);
+		for (int upd = start; upd < end; upd++)
+			PScript_UpdateParticle (particle_updates[upd].p, particle_updates[upd].type, p_frametime, p_doflurry, &rng);
+	}
+}
+
+static void PScript_UpdateParticleTypes (float pframetime)
+{
+	void (*bdraw) (scenetris_t *t, beamseg_t *p, plooks_t *type);
+	void (*tdraw) (scenetris_t *t, particle_t *p, plooks_t *type);
+	void (*emit_core) (scenetris_t *t, particle_t *p, plooks_t *type, unsigned int vertofs, unsigned int idxofs);
+	int vpp, ipp;
+
+	vec3_t			oldorg;
+	vec3_t			stop;
+	part_type_t	   *type, *lastvalidtype;
+	particle_t	   *p;
+	clippeddecal_t *d, *dkill;
+	ramp_t		   *ramp;
+	scenetris_t	   *scenetri;
+	particle_t	   *kill_list = p_kill_list, *kill_first = p_kill_first;
+	beamseg_t	   *b, *bkill;
+
+	int rampind;
+	int batchflags;
 
 	for (type = part_run_list, lastvalidtype = NULL; type != NULL; type = type->nexttorun)
 	{
@@ -6313,7 +6922,9 @@ static void PScript_UpdateParticleTypes (float pframetime)
 
 		bdraw = NULL;
 		tdraw = NULL;
+		emit_core = NULL;
 		batchflags = 0;
+		vpp = ipp = 0;
 
 		// set drawing methods by type and cvars and hope branch
 		// prediction takes care of the rest
@@ -6329,20 +6940,80 @@ static void PScript_UpdateParticleTypes (float pframetime)
 			break;
 		case PT_UDECAL:
 			tdraw = R_AddUnclippedDecal;
+			emit_core = R_EmitUnclippedDecal;
+			vpp = 4;
+			ipp = 6;
 			break;
 		case PT_NORMAL:
 			tdraw = R_AddTexturedParticle;
+			emit_core = R_EmitTexturedParticle;
+			vpp = 4;
+			ipp = 6;
 			break;
 		case PT_SPARK:
 			tdraw = R_AddLineSparkParticle;
+			emit_core = R_EmitLineSparkParticle;
+			vpp = 2;
+			ipp = 2;
 			batchflags = BEF_LINES;
 			break;
 		case PT_SPARKFAN:
 			tdraw = R_AddFanSparkParticle;
+			emit_core = R_EmitFanSparkParticle;
+			vpp = 3;
+			ipp = 3;
 			break;
 		case PT_TEXTUREDSPARK:
 			tdraw = R_AddTSparkParticle;
+			emit_core = R_EmitTSparkParticle;
+			vpp = 4;
+			ipp = 6;
 			break;
+		}
+
+		// types with a fixed size draw function only get their batches and vertex ranges
+		// reserved here, the vertices are written in parallel by PScript_EmitParticlesTask
+		if (emit_core && type->die)
+		{
+			particle_emit_meta_t *meta = &type_emit_meta[type - part_type];
+			if (meta->count)
+			{
+				const qboolean use_oit = PScript_LooksUseWBOIT (type->slooks);
+				int			   remaining = meta->count;
+
+				meta->vpp = vpp;
+				meta->ipp = ipp;
+				meta->ppb = (MAX_INDICES - 8) / vpp;
+				meta->first_stri = (int)cl_numstris;
+				meta->emit_core = emit_core;
+
+				while (remaining > 0)
+				{
+					const int n = q_min (remaining, meta->ppb);
+					if (cl_numstris == cl_maxstris)
+					{
+						cl_maxstris += 8;
+						cl_stris = Mem_Realloc (cl_stris, sizeof (*cl_stris) * cl_maxstris);
+					}
+					scenetri = &cl_stris[cl_numstris++];
+					scenetri->texture = type->looks.texture;
+					scenetri->blendmode = type->looks.blendmode;
+					scenetri->beflags = batchflags;
+					scenetri->use_oit = use_oit;
+					scenetri->firstidx = cl_numstrisidx;
+					scenetri->firstvert = cl_numstrisvert;
+					scenetri->numvert = n * vpp;
+					scenetri->numidx = n * ipp;
+					while (cl_numstrisvert + n * vpp > cl_maxstrisvert[current_buffer_index])
+						ReallocateVertexBuffer ();
+					while (cl_numstrisidx + n * ipp > cl_maxstrisidx[current_buffer_index])
+						ReallocateIndexBuffer ();
+					cl_numstrisvert += n * vpp;
+					cl_numstrisidx += n * ipp;
+					remaining -= n;
+				}
+			}
+			goto endtype;
 		}
 
 		const qboolean use_oit = PScript_LooksUseWBOIT (type->slooks);
@@ -6396,7 +7067,7 @@ static void PScript_UpdateParticleTypes (float pframetime)
 
 				// make sure emitter runs at least once
 				if (type->emit >= 0 && type->emitstart <= 0)
-					PScript_RunParticleEffectState (p->org, p->vel, 1, type->emit, NULL);
+					PScript_QueueEffect (p->org, p->vel, 1, type->emit);
 
 				type->particles = p->next;
 				p->next = kill_list;
@@ -6450,285 +7121,6 @@ static void PScript_UpdateParticleTypes (float pframetime)
 			}
 
 			goto endtype;
-		}
-
-		// kill off early ones.
-		if (type->emittime < 0)
-		{
-			for (;;)
-			{
-				kill = type->particles;
-				if (kill && kill->die < particletime)
-				{
-					PScript_DelinkTrailstate (&kill->state.trailstate);
-					type->particles = kill->next;
-					kill->next = kill_list;
-					kill_list = kill;
-					if (!kill_first)
-						kill_first = kill;
-					continue;
-				}
-				break;
-			}
-		}
-		else
-		{
-			for (;;)
-			{
-				kill = type->particles;
-				if (kill && kill->die < particletime)
-				{
-					type->particles = kill->next;
-					kill->next = kill_list;
-					kill_list = kill;
-					if (!kill_first)
-						kill_first = kill;
-					continue;
-				}
-				break;
-			}
-		}
-
-		grav = type->gravity * pframetime;
-		friction[0] = 1 - type->friction[0] * pframetime;
-		friction[1] = 1 - type->friction[1] * pframetime;
-		friction[2] = 1 - type->friction[2] * pframetime;
-
-		for (p = type->particles; p; p = p->next)
-		{
-			if (type->emittime < 0)
-			{
-				for (;;)
-				{
-					kill = p->next;
-					if (kill && kill->die < particletime)
-					{
-						PScript_DelinkTrailstate (&kill->state.trailstate);
-						p->next = kill->next;
-						kill->next = kill_list;
-						kill_list = kill;
-						if (!kill_first)
-							kill_first = kill;
-						continue;
-					}
-					break;
-				}
-			}
-			else
-			{
-				for (;;)
-				{
-					kill = p->next;
-					if (kill && kill->die < particletime)
-					{
-						p->next = kill->next;
-						kill->next = kill_list;
-						kill_list = kill;
-						if (!kill_first)
-							kill_first = kill;
-						continue;
-					}
-					break;
-				}
-			}
-
-			VectorCopy (p->org, oldorg);
-			if (type->flags & PT_VELOCITY)
-			{
-				p->org[0] += p->vel[0] * pframetime;
-				p->org[1] += p->vel[1] * pframetime;
-				p->org[2] += p->vel[2] * pframetime;
-				p->vel[2] -= grav;
-				if (type->flags & PT_FRICTION)
-				{
-					p->vel[0] *= friction[0];
-					p->vel[1] *= friction[1];
-					p->vel[2] *= friction[2];
-				}
-				if (type->flurry && doflurry)
-				{ // these should probably be partially synced,
-					p->vel[0] += crandom () * type->flurry;
-					p->vel[1] += crandom () * type->flurry;
-				}
-			}
-
-			p->angle += p->rotationspeed * pframetime;
-
-			switch (type->rampmode)
-			{
-			case RAMP_NEAREST:
-				rampind = (int)(type->rampindexes * (type->die - (p->die - particletime)) / type->die);
-				if (rampind >= type->rampindexes)
-					rampind = type->rampindexes - 1;
-				ramp = type->ramp + rampind;
-				VectorCopy (ramp->rgb, p->rgba);
-				p->rgba[3] = ramp->alpha;
-				p->scale = ramp->scale;
-				break;
-			case RAMP_LERP:
-			{
-				float frac = (type->rampindexes * (type->die - (p->die - particletime)) / type->die);
-				int	  s1, s2;
-				s1 = frac;
-				s2 = s1 + 1;
-				if (s1 > type->rampindexes - 1)
-					s1 = type->rampindexes - 1;
-				if (s2 > type->rampindexes - 1)
-					s2 = type->rampindexes - 1;
-				frac -= s1;
-				VectorInterpolate (type->ramp[s1].rgb, frac, type->ramp[s2].rgb, p->rgba);
-				FloatInterpolate (type->ramp[s1].alpha, frac, type->ramp[s2].alpha, p->rgba[3]);
-				FloatInterpolate (type->ramp[s1].scale, frac, type->ramp[s2].scale, p->scale);
-			}
-			break;
-			case RAMP_DELTA: // particle ramps
-				rampind = (int)(type->rampindexes * (type->die - (p->die - particletime)) / type->die);
-				if (rampind >= type->rampindexes)
-					rampind = type->rampindexes - 1;
-				ramp = type->ramp + rampind;
-				VectorMA (p->rgba, pframetime, ramp->rgb, p->rgba);
-				p->rgba[3] -= pframetime * ramp->alpha;
-				p->scale += pframetime * ramp->scale;
-				break;
-			case RAMP_NONE: // particle changes acording to it's preset properties.
-				if (particletime < (p->die - type->die + type->rgbchangetime))
-				{
-					p->rgba[0] += pframetime * type->rgbchange[0];
-					p->rgba[1] += pframetime * type->rgbchange[1];
-					p->rgba[2] += pframetime * type->rgbchange[2];
-				}
-				p->rgba[3] += pframetime * type->alphachange;
-				p->scale += pframetime * type->scaledelta;
-			}
-
-			if (type->emit >= 0)
-			{
-				if (type->emittime < 0)
-					PScript_ParticleTrail (oldorg, p->org, type->emit, pframetime, 0, NULL, &p->state.trailstate);
-				else if (p->state.nextemit < particletime)
-				{
-					p->state.nextemit = particletime + type->emittime + frandom () * type->emitrand;
-					PScript_RunParticleEffectState (p->org, p->vel, 1, type->emit, NULL);
-				}
-			}
-
-			if (type->cliptype >= 0 && r_bouncysparks.value)
-			{
-				VectorSubtract (p->org, p->oldorg, stop);
-				if (!type->clipbounce || DotProduct (stop, stop) > 10 * 10)
-				{
-					int e;
-					if (traces-- > 0 && CL_TraceLine (p->oldorg, p->org, stop, normal, &e) < 1)
-					{
-						if (type->clipbounce < 0)
-						{
-							p->die = -1;
-#ifdef USE_DECALS
-							if (type->clipbounce == -2)
-							{ // this type of particle splatters itself as a decal when it hits a wall.
-								decalctx_t ctx;
-								float	   m;
-								vec3_t	   vec = {0.5, 0.5, 0.431};
-								qmodel_t  *model;
-
-								ctx.entity = e;
-								if (!ctx.entity)
-								{
-									model = cl.worldmodel;
-									VectorCopy (p->org, ctx.center);
-								}
-								else if (e)
-								{ // this trace hit a door or something.
-									entity_t *ent = CL_EntityNum (e);
-									model = ent->model;
-									VectorSubtract (p->org, ent->origin, ctx.center);
-									// FIXME: rotate center+normal around entity.
-								}
-								else
-									continue; // err, no idea.
-
-								VectorScale (normal, -1, ctx.normal);
-								VectorNormalize (ctx.normal);
-
-								VectorNormalize (vec);
-								CrossProduct (ctx.normal, vec, ctx.tangent1);
-								RotatePointAroundVector (ctx.tangent2, ctx.normal, ctx.tangent1, frandom () * 360);
-								CrossProduct (ctx.normal, ctx.tangent2, ctx.tangent1);
-
-								VectorNormalize (ctx.tangent1);
-								VectorNormalize (ctx.tangent2);
-
-								ctx.ptype = type;
-								ctx.scale1 = type->s2 - type->s1;
-								ctx.bias1 = type->s1 + (ctx.scale1 * 0.5);
-								ctx.scale2 = type->t2 - type->t1;
-								ctx.bias2 = type->t1 + (ctx.scale2 * 0.5);
-								m = p->scale * (1.5 + frandom () * 0.5) * 0.5; // decals should be a little bigger, for some reason.
-								ctx.scale0 = 2.0 / m;
-								ctx.scale1 /= m;
-								ctx.scale2 /= m;
-
-								// inserts decals through a callback.
-								Mod_ClipDecal (
-									model, ctx.center, ctx.normal, ctx.tangent2, ctx.tangent1, m, type->surfflagmask, type->surfflagmatch, PScript_AddDecals,
-									&ctx);
-							}
-#endif
-							continue;
-						}
-						else if (part_type + type->cliptype == type)
-						{										// bounce
-							dist = DotProduct (p->vel, normal); // * (-1-(rand()/(float)0x7fff)/2);
-							dist *= -type->clipbounce;
-							VectorMA (p->vel, dist, normal, p->vel);
-							VectorCopy (stop, p->org);
-
-							if (!*type->texname && VectorLength (p->vel) < 1000 * pframetime && type->looks.type == PT_NORMAL)
-							{
-								p->die = -1;
-								continue;
-							}
-						}
-						else
-						{
-							p->die = -1;
-							VectorNormalize (p->vel);
-
-							if (type->clipbounce)
-							{
-								VectorScale (normal, type->clipbounce, normal);
-								PScript_RunParticleEffectState (stop, normal, type->clipcount / part_type[type->cliptype].count, type->cliptype, NULL);
-							}
-							else
-								PScript_RunParticleEffectState (stop, p->vel, type->clipcount / part_type[type->cliptype].count, type->cliptype, NULL);
-							continue;
-						}
-					}
-					VectorCopy (p->org, p->oldorg);
-				}
-			}
-			if (scenetri && tdraw)
-			{
-				if (cl_numstrisvert - scenetri->firstvert >= MAX_INDICES - 6)
-				{
-					// generate a new mesh if the old one overflowed. yay smc...
-					if (cl_numstris == cl_maxstris)
-					{
-						cl_maxstris += 8;
-						cl_stris = Mem_Realloc (cl_stris, sizeof (*cl_stris) * cl_maxstris);
-					}
-					scenetri = &cl_stris[cl_numstris++];
-					scenetri->texture = scenetri[-1].texture;
-					scenetri->blendmode = scenetri[-1].blendmode;
-					scenetri->beflags = scenetri[-1].beflags;
-					scenetri->use_oit = scenetri[-1].use_oit;
-					scenetri->firstidx = cl_numstrisidx;
-					scenetri->firstvert = cl_numstrisvert;
-					scenetri->numvert = 0;
-					scenetri->numidx = 0;
-				}
-				tdraw (scenetri, p, type->slooks);
-			}
 		}
 
 		// beams are dealt with here
@@ -6825,6 +7217,70 @@ static void PScript_UpdateParticleTypes (float pframetime)
 			lastvalidtype = type;
 	}
 
+	// run the spawns that were queued during the update. New particles get their first
+	// update and draw next frame, which also gives every emitted effect the same timing
+	// instead of depending on the run list order of its parent type
+	for (int w = 0; w < TASKS_MAX_WORKERS; w++)
+	{
+		deferred_queues_t *queue = &deferred_queues[w];
+		for (int fx = 0; fx < queue->num_trails; fx++)
+			PScript_ParticleTrail (queue->trails[fx].start, queue->trails[fx].end, queue->trails[fx].type, pframetime, 0, NULL, queue->trails[fx].tsk);
+		queue->num_trails = 0;
+		for (int fx = 0; fx < queue->num_effects; fx++)
+			PScript_RunParticleEffectState (queue->effects[fx].org, queue->effects[fx].dir, queue->effects[fx].count, queue->effects[fx].type, NULL);
+		queue->num_effects = 0;
+#ifdef USE_DECALS
+		for (int fx = 0; fx < queue->num_decals; fx++)
+		{
+			deferred_decal_t *dd = &queue->decals[fx];
+			part_type_t		 *dtype = dd->type;
+			decalctx_t		  ctx;
+			float			  m;
+			vec3_t			  vec = {0.5, 0.5, 0.431};
+			qmodel_t		 *model;
+
+			ctx.entity = dd->entity;
+			if (!ctx.entity)
+			{
+				model = cl.worldmodel;
+				VectorCopy (dd->center, ctx.center);
+			}
+			else
+			{ // this trace hit a door or something.
+				entity_t *ent = CL_EntityNum (ctx.entity);
+				model = ent->model;
+				VectorSubtract (dd->center, ent->origin, ctx.center);
+				// FIXME: rotate center+normal around entity.
+			}
+
+			VectorScale (dd->normal, -1, ctx.normal);
+			VectorNormalize (ctx.normal);
+
+			VectorNormalize (vec);
+			CrossProduct (ctx.normal, vec, ctx.tangent1);
+			RotatePointAroundVector (ctx.tangent2, ctx.normal, ctx.tangent1, frandom () * 360);
+			CrossProduct (ctx.normal, ctx.tangent2, ctx.tangent1);
+
+			VectorNormalize (ctx.tangent1);
+			VectorNormalize (ctx.tangent2);
+
+			ctx.ptype = dtype;
+			ctx.scale1 = dtype->s2 - dtype->s1;
+			ctx.bias1 = dtype->s1 + (ctx.scale1 * 0.5);
+			ctx.scale2 = dtype->t2 - dtype->t1;
+			ctx.bias2 = dtype->t1 + (ctx.scale2 * 0.5);
+			m = dd->scale * (1.5 + frandom () * 0.5) * 0.5; // decals should be a little bigger, for some reason.
+			ctx.scale0 = 2.0 / m;
+			ctx.scale1 /= m;
+			ctx.scale2 /= m;
+
+			// inserts decals through a callback.
+			Mod_ClipDecal (model, ctx.center, ctx.normal, ctx.tangent2, ctx.tangent1, m, dtype->surfflagmask, dtype->surfflagmatch, PScript_AddDecals, &ctx);
+		}
+		queue->num_decals = 0;
+#endif
+	}
+
 	// lazy delete for particles is done here
 	if (kill_list)
 	{
@@ -6840,21 +7296,16 @@ static void PScript_UpdateParticleTypes (float pframetime)
 PScript_DrawParticles
 ===============
 */
-void PScript_DrawParticles (cb_context_t *blend_cbx, cb_context_t *wboit_cbx)
+/*
+===============
+PScript_LayoutParticlesTask
+
+Serial: batch creation and vertex range reservation for the fixed size particle
+types, decals, beams and zero lifetime drains, then the deferred spawns
+===============
+*/
+void PScript_LayoutParticlesTask (void *unused)
 {
-	int			 i;
-	entity_t	*ent;
-	vec3_t		 axis[3];
-	float		 pframetime;
-	static float oldtime;
-
-	pframetime = cl.time - oldtime;
-	if (pframetime < 0)
-		pframetime = 0;
-	if (pframetime > 1)
-		pframetime = 1;
-	oldtime = cl.time;
-
 	current_buffer_index = (current_buffer_index + 1) % 2;
 	cl_numstris = 0;
 	cl_numstrisvert = 0;
@@ -6865,23 +7316,54 @@ void PScript_DrawParticles (cb_context_t *blend_cbx, cb_context_t *wboit_cbx)
 	if (!r_particles.value)
 		return;
 
-	if (r_part_rain.value && r_fteparticles.value)
+	PScript_UpdateParticleTypes (p_frametime);
+}
+
+/*
+===============
+PScript_EmitParticlesTask
+
+Indexed over the worker count: fills the vertex ranges reserved by the layout.
+Every slot is addressed arithmetically so the workers never contend
+===============
+*/
+void PScript_EmitParticlesTask (int index, void *unused)
+{
+	const int stride = q_max (Tasks_NumWorkers (), 1) * PARTICLE_UPDATE_CHUNK_SIZE;
+	for (int start = index * PARTICLE_UPDATE_CHUNK_SIZE; start < num_particle_updates; start += stride)
 	{
-		for (i = 0; i < cl.num_entities; i++)
+		const int end = q_min (start + PARTICLE_UPDATE_CHUNK_SIZE, num_particle_updates);
+		for (int i = start; i < end; i++)
 		{
-			ent = &cl.entities[i];
-			if (!ent->model || ent->model->needload)
+			particle_t				   *p = particle_updates[i].p;
+			part_type_t				   *type = particle_updates[i].type;
+			const particle_emit_meta_t *meta = &type_emit_meta[type - part_type];
+			if (!meta->emit_core)
 				continue;
-			if (!ent->model->skytris)
+			const int		   local = i - meta->start;
+			scenetris_t		  *stri = &cl_stris[meta->first_stri + (local / meta->ppb)];
+			const int		   batch_local = local % meta->ppb;
+			const unsigned int vertofs = stri->firstvert + batch_local * meta->vpp;
+			const unsigned int idxofs = stri->firstidx + batch_local * meta->ipp;
+			if (p->die < particletime)
+			{
+				// died during the update: fill the reserved slot with degenerate primitives
+				memset (&cl_curstrisvert[vertofs], 0, meta->vpp * sizeof (basicvertex_t));
+				for (int k = 0; k < meta->ipp; k++)
+					cl_curstrisidx[idxofs + k] = vertofs - stri->firstvert;
 				continue;
-			AngleVectors (ent->angles, axis[0], axis[1], axis[2]);
-			// this timer, as well as the per-tri timer, are unable to deal with certain rates+sizes. it would be good to fix that...
-			// it would also be nice to do mdls too...
-			P_AddRainParticles (ent->model, axis, ent->origin, pframetime);
+			}
+			meta->emit_core (stri, p, type->slooks, vertofs, idxofs);
 		}
 	}
+}
 
-	PScript_UpdateParticleTypes (pframetime);
+void PScript_DrawParticles (cb_context_t *blend_cbx, cb_context_t *wboit_cbx)
+{
+	if (!r_particles.value)
+		return;
+
+	// simulated and emitted by the PScript_*ParticlesTask graph nodes, this only records the draws
 	PScript_DrawParticleBatches (blend_cbx, false, wboit_cbx != NULL);
 	PScript_DrawParticleBatches (wboit_cbx, true, true);
 }

@@ -9,10 +9,15 @@ STRIP ?= strip
 WINDRES ?= windres
 GLSLANG = glslangValidator
 DEBUG ?= 0
+USE_SDL3 ?= 1
+
+ifeq ($(USE_SDL3),1)
+CFLAGS += -DUSE_SDL3
+endif
 
 CHECK_GCC = $(shell if echo | $(CC) $(1) -Werror -S -o /dev/null -xc - > /dev/null 2>&1; then echo "$(1)"; else echo "$(2)"; fi;)
 
-CFLAGS += -MMD -Wall -Wno-trigraphs -Werror -std=gnu11
+CFLAGS += -MMD -Wall -Wno-trigraphs -Werror -std=gnu11 -fno-common
 ifneq ($(HOST_OS),darwin)
 CFLAGS += -D_FILE_OFFSET_BITS=64
 endif
@@ -129,9 +134,9 @@ MUSIC_OBJS:= bgmusic.o \
 	snd_xmp.o \
 	snd_umx.o
 COMOBJ_SND := snd_dma.o snd_mix.o snd_mem.o $(MUSIC_OBJS)
-SYSOBJ_SND := snd_sdl.o
+SYSOBJ_SND := snd_sdl.o snd_sdl3.o
 SYSOBJ_CDA := cd_sdl.o
-SYSOBJ_INPUT := in_sdl.o in_sdl2.o
+SYSOBJ_INPUT := in_sdl.o in_sdl2.o in_sdl3.o
 SYSOBJ_GL_VID:= gl_vidsdl.o
 SYSOBJ_MAIN:= main_sdl.o
 
@@ -140,8 +145,19 @@ SHADER_OBJS = \
 	alias_oit_frag.o \
 	alias_alphatest_frag.o \
 	alias_alphatest_oit_frag.o \
+	alias_mboit_moment_frag.o \
+	alias_alphatest_mboit_moment_frag.o \
+	alias_mboit_composite_frag.o \
+	alias_alphatest_mboit_composite_frag.o \
+	alias_mboit_composite_msaa_frag.o \
+	alias_alphatest_mboit_composite_msaa_frag.o \
+	md5_mboit_composite_frag.o \
+	md5_alphatest_mboit_composite_frag.o \
+	md5_mboit_composite_msaa_frag.o \
+	md5_alphatest_mboit_composite_msaa_frag.o \
 	alias_vert.o \
 	md5_vert.o \
+	md5_8_vert.o \
 	basic_alphatest_frag.o \
 	screen_effects_8bit_comp.o \
 	screen_effects_8bit_scale_comp.o \
@@ -154,7 +170,15 @@ SHADER_OBJS = \
 	indirect_clear_comp.o \
 	basic_frag.o \
 	basic_oit_frag.o \
+	basic_mboit_moment_frag.o \
+	basic_mboit_composite_frag.o \
+	basic_mboit_composite_msaa_frag.o \
 	basic_notex_frag.o \
+	draw_pic_frag.o \
+	draw_pic_alphatest_frag.o \
+	draw_pic_xbr_frag.o \
+	draw_pic_xbr_alphatest_frag.o \
+	draw_pic_xbr_vert.o \
 	basic_vert.o \
 	sky_layer_frag.o \
 	sky_layer_vert.o \
@@ -165,18 +189,25 @@ SHADER_OBJS = \
 	postprocess_vert.o \
 	wboit_resolve_frag.o \
 	wboit_resolve_msaa_frag.o \
+	mboit_resolve_frag.o \
+	mboit_resolve_msaa_frag.o \
 	world_frag.o \
 	world_oit_frag.o \
+	world_mboit_moment_frag.o \
+	world_mboit_composite_frag.o \
+	world_mboit_composite_msaa_frag.o \
 	world_vert.o \
 	showtris_frag.o \
 	showtris_vert.o \
+	md5_debug_vert.o \
 	update_lightmap_8bit_comp.o \
 	update_lightmap_8bit_rt_comp.o \
 	update_lightmap_10bit_comp.o \
 	update_lightmap_10bit_rt_comp.o \
 	ray_debug_comp.o \
 	mesh_interpolate_comp.o \
-	skinning_comp.o
+	skinning_comp.o \
+	skinning_8_comp.o
 
 GLOBJS = \
 	palette.o \
@@ -230,6 +261,8 @@ OBJS := strlcat.o \
 	crc.o \
 	cvar.o \
 	cfgfile.o \
+	json.o \
+	steam.o \
 	host.o \
 	host_cmd.o \
 	mathlib.o \
@@ -267,8 +300,6 @@ $(BINTOC_EXE): ../Shaders/bintoc.c
 	$(CC) $(DFLAGS) -c $(CFLAGS) $(SDL_CFLAGS) -o $@ ../Shaders/Compiled/$(GLSLANG_OUT_FOLDER)/$*_vert.c
 
 .SECONDARY:
-../Shaders/Compiled/$(GLSLANG_OUT_FOLDER)/%_sops_comp.spv: ../Shaders/%_sops.comp
-	$(GLSLANG) $(GLSLANG_FLAGS) --target-env vulkan1.1 $< -o $@ --depfile ../Shaders/Compiled/$(GLSLANG_OUT_FOLDER)/$*_sops_comp.d
 %_sops_comp.o: ../Shaders/Compiled/$(GLSLANG_OUT_FOLDER)/%_sops_comp.spv $(BINTOC_EXE)
 	$(BINTOC_EXE) $< $*_sops_comp_spv ../Shaders/Compiled/$(GLSLANG_OUT_FOLDER)/$*_sops_comp.c
 	$(CC) $(DFLAGS) -c $(CFLAGS) $(SDL_CFLAGS) -o $@ ../Shaders/Compiled/$(GLSLANG_OUT_FOLDER)/$*_sops_comp.c
@@ -294,6 +325,48 @@ embedded_pak.o:  embedded_pak.c
 	$(CC) $(DFLAGS) -c $(CFLAGS) -o $@ $<
 
 sinclude $(OBJS:.o=.d)
+# shader sources compiled multiple times with different preprocessor defines
+define SHADER_VARIANT
+../Shaders/Compiled/$$(GLSLANG_OUT_FOLDER)/$(1).spv: ../Shaders/$(2)
+	$$(GLSLANG) $$(GLSLANG_FLAGS) $(3) $$< -o $$@ --depfile ../Shaders/Compiled/$$(GLSLANG_OUT_FOLDER)/$(1).d
+endef
+
+$(eval $(call SHADER_VARIANT,basic_oit_frag,basic.frag,-DWBOIT=1))
+$(eval $(call SHADER_VARIANT,basic_mboit_moment_frag,basic.frag,-DMBOIT=1))
+$(eval $(call SHADER_VARIANT,basic_mboit_composite_frag,basic.frag,-DMBOIT=1 -DMBOIT_COMPOSITE=1))
+$(eval $(call SHADER_VARIANT,basic_mboit_composite_msaa_frag,basic.frag,-DMBOIT=1 -DMBOIT_COMPOSITE=1 -DMSAA=1))
+$(eval $(call SHADER_VARIANT,world_oit_frag,world.frag,-DWBOIT=1))
+$(eval $(call SHADER_VARIANT,world_mboit_moment_frag,world.frag,-DMBOIT=1))
+$(eval $(call SHADER_VARIANT,world_mboit_composite_frag,world.frag,-DMBOIT=1 -DMBOIT_COMPOSITE=1))
+$(eval $(call SHADER_VARIANT,world_mboit_composite_msaa_frag,world.frag,-DMBOIT=1 -DMBOIT_COMPOSITE=1 -DMSAA=1))
+$(eval $(call SHADER_VARIANT,alias_alphatest_frag,alias.frag,-DALIAS_ALPHA_TEST=1))
+$(eval $(call SHADER_VARIANT,alias_oit_frag,alias.frag,-DWBOIT=1))
+$(eval $(call SHADER_VARIANT,alias_alphatest_oit_frag,alias.frag,-DALIAS_ALPHA_TEST=1 -DWBOIT=1))
+$(eval $(call SHADER_VARIANT,alias_mboit_moment_frag,alias.frag,-DMBOIT=1))
+$(eval $(call SHADER_VARIANT,alias_alphatest_mboit_moment_frag,alias.frag,-DALIAS_ALPHA_TEST=1 -DMBOIT=1))
+$(eval $(call SHADER_VARIANT,alias_mboit_composite_frag,alias.frag,-DMBOIT=1 -DMBOIT_COMPOSITE=1))
+$(eval $(call SHADER_VARIANT,alias_alphatest_mboit_composite_frag,alias.frag,-DALIAS_ALPHA_TEST=1 -DMBOIT=1 -DMBOIT_COMPOSITE=1))
+$(eval $(call SHADER_VARIANT,alias_mboit_composite_msaa_frag,alias.frag,-DMBOIT=1 -DMBOIT_COMPOSITE=1 -DMSAA=1))
+$(eval $(call SHADER_VARIANT,alias_alphatest_mboit_composite_msaa_frag,alias.frag,-DALIAS_ALPHA_TEST=1 -DMBOIT=1 -DMBOIT_COMPOSITE=1 -DMSAA=1))
+$(eval $(call SHADER_VARIANT,md5_mboit_composite_frag,alias.frag,-DMBOIT=1 -DMBOIT_COMPOSITE=1 -DMBOIT_INPUT_SET=4))
+$(eval $(call SHADER_VARIANT,md5_alphatest_mboit_composite_frag,alias.frag,-DALIAS_ALPHA_TEST=1 -DMBOIT=1 -DMBOIT_COMPOSITE=1 -DMBOIT_INPUT_SET=4))
+$(eval $(call SHADER_VARIANT,md5_mboit_composite_msaa_frag,alias.frag,-DMBOIT=1 -DMBOIT_COMPOSITE=1 -DMSAA=1 -DMBOIT_INPUT_SET=4))
+$(eval $(call SHADER_VARIANT,md5_alphatest_mboit_composite_msaa_frag,alias.frag,-DALIAS_ALPHA_TEST=1 -DMBOIT=1 -DMBOIT_COMPOSITE=1 -DMSAA=1 -DMBOIT_INPUT_SET=4))
+$(eval $(call SHADER_VARIANT,md5_8_vert,md5.vert,-DEIGHT_WEIGHT_SKINNING))
+$(eval $(call SHADER_VARIANT,wboit_resolve_msaa_frag,wboit_resolve.frag,-DMSAA=1))
+$(eval $(call SHADER_VARIANT,mboit_resolve_msaa_frag,mboit_resolve.frag,-DMSAA=1))
+$(eval $(call SHADER_VARIANT,screen_effects_8bit_comp,screen_effects.comp,))
+$(eval $(call SHADER_VARIANT,screen_effects_8bit_scale_comp,screen_effects.comp,-DSCALING=1))
+$(eval $(call SHADER_VARIANT,screen_effects_8bit_scale_sops_comp,screen_effects.comp,--target-env vulkan1.1 -DSCALING=1 -DUSE_SUBGROUP_OPS=1))
+$(eval $(call SHADER_VARIANT,screen_effects_10bit_comp,screen_effects.comp,-DUSE_10BIT=1))
+$(eval $(call SHADER_VARIANT,screen_effects_10bit_scale_comp,screen_effects.comp,-DUSE_10BIT=1 -DSCALING=1))
+$(eval $(call SHADER_VARIANT,screen_effects_10bit_scale_sops_comp,screen_effects.comp,--target-env vulkan1.1 -DUSE_10BIT=1 -DSCALING=1 -DUSE_SUBGROUP_OPS=1))
+$(eval $(call SHADER_VARIANT,skinning_8_comp,skinning.comp,-DEIGHT_WEIGHT_SKINNING))
+$(eval $(call SHADER_VARIANT,update_lightmap_8bit_comp,update_lightmap.comp,))
+$(eval $(call SHADER_VARIANT,update_lightmap_8bit_rt_comp,update_lightmap.comp,-DRAY_QUERIES=1))
+$(eval $(call SHADER_VARIANT,update_lightmap_10bit_comp,update_lightmap.comp,-DUSE_10BIT=1))
+$(eval $(call SHADER_VARIANT,update_lightmap_10bit_rt_comp,update_lightmap.comp,-DUSE_10BIT=1 -DRAY_QUERIES=1))
+
 sinclude $(SHADER_OBJS:%.o=../Shaders/Compiled/$(GLSLANG_OUT_FOLDER)/%.d)
 
 .PHONY:	clean debug release

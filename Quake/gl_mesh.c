@@ -265,7 +265,7 @@ void GL_MakeAliasModelDisplayLists (qmodel_t *m, aliashdr_t *paliashdr)
 
 	// upload immediately
 	paliashdr->poseverttype = PV_QUAKE1;
-	GLMesh_UploadBuffers (m, paliashdr, indexes, (byte *)verts, desc, NULL);
+	GLMesh_UploadBuffers (m, paliashdr, indexes, (byte *)verts, desc, NULL, NULL, 0);
 
 	TEMP_FREE (indexes);
 	TEMP_FREE (desc);
@@ -292,6 +292,8 @@ void GLMesh_DeleteMeshBuffers (aliashdr_t *mainhdr)
 		{
 			AddBufferGarbage (hdr->vertex_buffer, VK_NULL_HANDLE, hdr->vertex_allocation, VK_NULL_HANDLE, NULL);
 			AddBufferGarbage (hdr->index_buffer, VK_NULL_HANDLE, hdr->index_allocation, VK_NULL_HANDLE, NULL);
+			if (hdr->skeleton_index_buffer != VK_NULL_HANDLE)
+				AddBufferGarbage (hdr->skeleton_index_buffer, VK_NULL_HANDLE, hdr->skeleton_index_allocation, VK_NULL_HANDLE, NULL);
 			if (hdr->joints_buffer != VK_NULL_HANDLE)
 				AddBufferGarbage (hdr->joints_buffer, VK_NULL_HANDLE, hdr->joints_allocation, hdr->joints_set, &vulkan_globals.joints_buffer_set_layout);
 		}
@@ -305,6 +307,12 @@ void GLMesh_DeleteMeshBuffers (aliashdr_t *mainhdr)
 			vkDestroyBuffer (vulkan_globals.device, hdr->index_buffer, NULL);
 			GL_HeapFree (mesh_buffer_heap, hdr->index_allocation, &num_vulkan_mesh_allocations);
 
+			if (hdr->skeleton_index_buffer != VK_NULL_HANDLE)
+			{
+				vkDestroyBuffer (vulkan_globals.device, hdr->skeleton_index_buffer, NULL);
+				GL_HeapFree (mesh_buffer_heap, hdr->skeleton_index_allocation, &num_vulkan_mesh_allocations);
+			}
+
 			if (hdr->joints_buffer != VK_NULL_HANDLE)
 			{
 				vkDestroyBuffer (vulkan_globals.device, hdr->joints_buffer, NULL);
@@ -317,6 +325,8 @@ void GLMesh_DeleteMeshBuffers (aliashdr_t *mainhdr)
 		hdr->vertex_allocation = NULL;
 		hdr->index_buffer = VK_NULL_HANDLE;
 		hdr->index_allocation = NULL;
+		hdr->skeleton_index_buffer = VK_NULL_HANDLE;
+		hdr->skeleton_index_allocation = NULL;
 		hdr->joints_buffer = VK_NULL_HANDLE;
 		hdr->joints_allocation = NULL;
 		hdr->joints_set = VK_NULL_HANDLE;
@@ -330,7 +340,9 @@ void GLMesh_DeleteMeshBuffers (aliashdr_t *mainhdr)
 GLMesh_UploadBuffers : Upload data for a single aliashdr_t *hdr (not it's nextsurfaces)
 ================
 */
-void GLMesh_UploadBuffers (qmodel_t *mod, aliashdr_t *hdr, unsigned short *indexes, byte *vertexes, aliasmesh_t *desc, jointpose_t *joints)
+void GLMesh_UploadBuffers (
+	qmodel_t *mod, aliashdr_t *hdr, unsigned short *indexes, byte *vertexes, aliasmesh_t *desc, jointpose_t *joints, unsigned short *skeleton_indexes,
+	int num_skeleton_indexes)
 {
 	int		 numindexes = 0;
 	int		 numverts = 0;
@@ -365,6 +377,14 @@ void GLMesh_UploadBuffers (qmodel_t *mod, aliashdr_t *hdr, unsigned short *index
 		numindexes = hdr->numindexes;
 	}
 	break;
+	case PV_MD5_8:
+	{
+		assert (hdr->numposes == 1);
+		totalvbosize += hdr->numverts_vbo * (int)sizeof (md5vert8_t);
+		numverts = hdr->numverts_vbo;
+		numindexes = hdr->numindexes;
+	}
+	break;
 	default:
 		assert (false);
 	}
@@ -384,6 +404,7 @@ void GLMesh_UploadBuffers (qmodel_t *mod, aliashdr_t *hdr, unsigned short *index
 		return;
 	if (!totalvbosize)
 		return;
+	hdr->num_skeleton_indexes = num_skeleton_indexes;
 
 	{
 		const size_t totalindexsize = numindexes * sizeof (unsigned short);
@@ -420,6 +441,34 @@ void GLMesh_UploadBuffers (qmodel_t *mod, aliashdr_t *hdr, unsigned short *index
 			address_info.buffer = hdr->index_buffer;
 			hdr->index_buffer_address = vulkan_globals.vk_get_buffer_device_address (vulkan_globals.device, &address_info);
 		}
+	}
+
+	if (skeleton_indexes && num_skeleton_indexes > 0)
+	{
+		const size_t totalindexsize = (size_t)num_skeleton_indexes * sizeof (*skeleton_indexes);
+
+		ZEROED_STRUCT (VkBufferCreateInfo, buffer_create_info);
+		buffer_create_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+		buffer_create_info.size = totalindexsize;
+		buffer_create_info.usage = VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+		err = vkCreateBuffer (vulkan_globals.device, &buffer_create_info, NULL, &hdr->skeleton_index_buffer);
+		if (err != VK_SUCCESS)
+			Sys_Error ("vkCreateBuffer failed with code %i", (int)err);
+
+		GL_SetObjectName ((uint64_t)hdr->skeleton_index_buffer, VK_OBJECT_TYPE_BUFFER, mod->name);
+
+		VkMemoryRequirements memory_requirements;
+		vkGetBufferMemoryRequirements (vulkan_globals.device, hdr->skeleton_index_buffer, &memory_requirements);
+
+		hdr->skeleton_index_allocation =
+			GL_HeapAllocate (mesh_buffer_heap, memory_requirements.size, memory_requirements.alignment, &num_vulkan_mesh_allocations);
+		err = vkBindBufferMemory (
+			vulkan_globals.device, hdr->skeleton_index_buffer, GL_HeapGetAllocationMemory (hdr->skeleton_index_allocation),
+			GL_HeapGetAllocationOffset (hdr->skeleton_index_allocation));
+		if (err != VK_SUCCESS)
+			Sys_Error ("vkBindBufferMemory failed with code %i", (int)err);
+
+		R_StagingUploadBuffer (hdr->skeleton_index_buffer, totalindexsize, (byte *)skeleton_indexes);
 	}
 
 	// create the vertex buffer (empty)
@@ -487,6 +536,7 @@ void GLMesh_UploadBuffers (qmodel_t *mod, aliashdr_t *hdr, unsigned short *index
 		}
 		break;
 	case PV_MD5:
+	case PV_MD5_8:
 		memcpy (vbodata, vertexes, totalvbosize);
 		// vertexes is already the concat of the hdr surface vertices, triangles, ST, and normals
 		// already baked in.
@@ -641,7 +691,7 @@ void GLMesh_DeleteAllMeshBuffers (void)
 ================
 R_AllocateEntityBLAS
 
-Allocate acceleration structure for an entity with an alias model.
+Allocate acceleration structure for an animated entity model.
 Handles MDL (PV_QUAKE1), MD3 (PV_QUAKE3), and MD5 (PV_MD5) models.
 ================
 */
@@ -651,7 +701,9 @@ void R_AllocateEntityBLAS (entity_t *e)
 		return;
 	if (!e->model || e->model->type != mod_alias)
 		return;
-	if (e->model->flags & EF_ROCKET)
+
+	const int modelflags = e->model->flags | ((e->effects >> 24) & 0xff);
+	if (modelflags & (EF_ROCKET | EF_GRENADE | EF_TRACER | EF_TRACER2 | EF_TRACER3))
 		return;
 
 	aliashdr_t *hdr = (aliashdr_t *)Mod_Extradata (e->model);
@@ -663,7 +715,7 @@ void R_AllocateEntityBLAS (entity_t *e)
 	if (num_triangles == 0)
 		return;
 
-	// Check if model or geometry changed - need to reallocate BLAS
+	// Check if the entity switched models; enhanced model reloads free all entity BLASes explicitly.
 	if (e->blas_data && (e->blas_data->model != e->model))
 		R_FreeEntityBLAS (e);
 
@@ -916,7 +968,7 @@ void R_UpdateAnimatedBLASes (cb_context_t *cbx)
 
 			// Get lerp data for vertex interpolation
 			lerpdata_t lerpdata;
-			R_SetupAliasFrame (e, hdr, e->frame, &lerpdata);
+			R_SetupAliasFrame (e, hdr, &lerpdata);
 			int	  pose1 = lerpdata.pose1;
 			int	  pose2 = lerpdata.pose2;
 			float blend = lerpdata.blend;
@@ -944,7 +996,7 @@ void R_UpdateAnimatedBLASes (cb_context_t *cbx)
 			VkDeviceAddress scratch_address = as_scratch_buffer.device_address + as_scratch_offset;
 
 			// Dispatch compute shader with push constants containing buffer addresses
-			if (hdr->poseverttype == PV_MD5)
+			if (hdr->poseverttype == PV_MD5 || hdr->poseverttype == PV_MD5_8)
 			{
 				// MD5 skinning
 				skinning_push_constants_t pc = {
@@ -957,7 +1009,9 @@ void R_UpdateAnimatedBLASes (cb_context_t *cbx)
 					.num_verts = hdr->numverts_vbo,
 					.blend_factor = blend,
 				};
-				R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_COMPUTE, vulkan_globals.skinning_pipeline);
+				R_BindPipeline (
+					cbx, VK_PIPELINE_BIND_POINT_COMPUTE,
+					(hdr->poseverttype == PV_MD5_8) ? vulkan_globals.skinning_8_pipeline : vulkan_globals.skinning_pipeline);
 				R_PushConstants (cbx, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof (pc), &pc);
 			}
 			else

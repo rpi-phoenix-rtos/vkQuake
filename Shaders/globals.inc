@@ -22,6 +22,12 @@ struct surface_t
 	vec4  vecs[2];
 };
 
+struct bmodel_instance_t
+{
+	vec4 transform[3];	// model to world, transposed rows
+	vec4 local_vieworg; // xyz: view origin in model space; w: static entity flag
+};
+
 struct draw_indirect_command_t
 {
 	uint indexCount;

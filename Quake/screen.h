@@ -35,6 +35,7 @@ void SCR_CenterPrintClear (void);
 void SCR_CenterPrint (const char *str);
 
 void SCR_BeginLoadingPlaque (void);
+void SCR_EndStartupLoadingPlaque (void);
 void SCR_EndLoadingPlaque (void);
 
 int SCR_ModalMessage (const char *text, float timeout); // johnfitz -- added timeout
@@ -59,6 +60,7 @@ extern cvar_t scr_conscale;
 extern cvar_t scr_relativescale;
 extern cvar_t scr_scale;
 extern cvar_t scr_crosshairscale;
+extern cvar_t scr_usekfont;
 // johnfitz
 
 #endif /* _QUAKE_SCREEN_H */

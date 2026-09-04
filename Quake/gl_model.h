@@ -345,7 +345,8 @@ typedef struct glheapallocation_s glheapallocation_t;
 typedef enum
 {
 	PV_QUAKE1 = 0, // trivertx_t (MDL)
-	PV_MD5,		   // md5vert_t (MD5)
+	PV_MD5,		   // md5vert_t (MD5, up to 4 influences)
+	PV_MD5_8,	   // md5vert8_t (MD5, up to 8 influences)
 	PV_QUAKE3,	   // md3XyzNormal_t (MD3)
 	PV_SIZE
 } poseverttype_t;
@@ -389,6 +390,9 @@ typedef struct aliashdr_s
 	glheapallocation_t *joints_allocation;
 	VkDeviceAddress		joints_buffer_address;
 	VkDescriptorSet		joints_set;
+	int					num_skeleton_indexes;
+	VkBuffer			skeleton_index_buffer;
+	glheapallocation_t *skeleton_index_allocation;
 	maliasframedesc_t	frames[1]; // variable sized
 } aliashdr_t;
 
@@ -433,16 +437,35 @@ MD5 MODELS
 #define IDMD5HEADER (('M' << 0) + ('D' << 8) + ('5' << 16) + ('V' << 24))
 #define MD5_VERSION "10"
 
-#define NUM_JOINT_INFLUENCES 4
+#define NUM_JOINT_INFLUENCES_4_WEIGHT 4
+#define NUM_JOINT_INFLUENCES_8_WEIGHT 8
 
 typedef struct md5vert_s
 {
 	float xyz[3];
 	float norm[3];
 	float st[2]; // these are separate for consistency
-	byte  joint_weights[NUM_JOINT_INFLUENCES];
-	byte  joint_indices[NUM_JOINT_INFLUENCES];
+	byte  joint_weights[NUM_JOINT_INFLUENCES_4_WEIGHT];
+	byte  joint_indices[NUM_JOINT_INFLUENCES_4_WEIGHT];
+	float joint_position_x[NUM_JOINT_INFLUENCES_4_WEIGHT]; // weighted joint-local positions
+	float joint_position_y[NUM_JOINT_INFLUENCES_4_WEIGHT];
+	float joint_position_z[NUM_JOINT_INFLUENCES_4_WEIGHT];
 } md5vert_t;
+
+typedef struct md5vert8_s
+{
+	float xyz[3];
+	float norm[3];
+	float st[2]; // these are separate for consistency
+	byte  joint_weights[NUM_JOINT_INFLUENCES_8_WEIGHT];
+	byte  joint_indices[NUM_JOINT_INFLUENCES_8_WEIGHT];
+	float joint_position_x[NUM_JOINT_INFLUENCES_8_WEIGHT]; // weighted joint-local positions
+	float joint_position_y[NUM_JOINT_INFLUENCES_8_WEIGHT];
+	float joint_position_z[NUM_JOINT_INFLUENCES_8_WEIGHT];
+} md5vert8_t;
+
+COMPILE_TIME_ASSERT (md5vert_t, sizeof (md5vert_t) == 88);
+COMPILE_TIME_ASSERT (md5vert8_t, sizeof (md5vert8_t) == 144);
 
 typedef struct jointpose_s
 {
@@ -720,5 +743,8 @@ byte	*Mod_LeafPVS (mleaf_t *leaf, qmodel_t *model);
 byte	*Mod_NoVisPVS (qmodel_t *model);
 
 void Mod_SetExtraFlags (qmodel_t *mod);
+
+size_t	 Mod_SanitizeMapDescription (char *dst, size_t dstsize, const char *src);
+qboolean Mod_LoadMapDescription (char *desc, size_t maxchars, const char *map);
 
 #endif // __MODEL__

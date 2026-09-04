@@ -28,7 +28,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 float Fog_GetDensity (void);
 void  Fog_GetColor (float *c);
 
-extern atomic_uint32_t rs_skypolys; // for r_speeds readout
+extern atomic_uint32_t rs_skypolys; // for scr_speeds readout
 static float		   skyflatcolor[3];
 static float		   skymins[2][6], skymaxs[2][6];
 
@@ -322,7 +322,7 @@ static void Skywind_Save_f (void)
 
 	q_snprintf (relname, sizeof (relname), "gfx/env/%s" SKYWIND_CFG, skybox.name);
 	q_snprintf (path, sizeof (path), "%s/%s", com_gamedir, relname);
-	f = fopen (path, "wt");
+	f = Sys_fopen (path, "wt");
 	if (!f)
 	{
 		Con_Printf ("Couldn't write '%s'.\n", relname);
@@ -337,7 +337,9 @@ static void Skywind_Save_f (void)
 
 	fclose (f);
 
-	Con_SafePrintf ("Wrote %s\n", relname);
+	Con_SafePrintf ("Wrote ");
+	Con_LinkPrintf (path, "%s", relname);
+	Con_SafePrintf ("\n");
 }
 
 /*

@@ -95,77 +95,40 @@ static void GL_DrawAliasFrame (
 {
 	vulkan_pipeline_t pipeline;
 
-	int pipeline_index = 0;
-
 	// only enable alpha management if entity have alpha or the surface texture has effective
 	// non-opaque pixels:
 	const bool has_alpha = (entity_alpha < 1.0f) || (tx->flags & TEXPREF_ALPHAPIXELS);
 
-	// was : pipeline_index = (showtris == 0) ? (((entity_alpha >= 1.0f) ? 0 : 2) + (alphatest ? 1 : 0)) : (3 + CLAMP (1, showtris, 2));
-	//  decomposed below for clarity:
+	int pipeline_index;
 	if (showtris == 0)
-	{
-		// depthBiasEnable = VK_FALSE;
-		// depthTestEnable = VK_TRUE;
-		//
-		//  has_alpha = none, alphatest = 0 ? => 0
-		//  depthWriteEnable = VK_TRUE;
-		//  blendEnable = VK_FALSE;
-		//
-		//  has_alpha = none, alphatest = 1 ? => 1
-		//  alias_alphatest_frag_module ON
-		//  depthWriteEnable = VK_TRUE;
-		//  blendEnable = VK_FALSE;
-		//
-		//  has_alpha = yes, alphatest = 0 ?  => 2
-		//  depthWriteEnable = VK_TRUE => VK_FALSE;
-		//  blendEnable = VK_FALSE => VK_TRUE;
-		//
-		//  has_alpha = yes, alphatest = 1 ?  => 3
-		//  alias_alphatest_frag_module ON
-		//  depthWriteEnable = VK_FALSE;
-		//  blendEnable = VK_TRUE;
-		pipeline_index = ((has_alpha ? 2 : 0) + (alphatest ? 1 : 0));
-	}
+		pipeline_index = (has_alpha ? MODEL_PIPELINE_ALPHA_BLEND_BIT : 0) | (alphatest ? MODEL_PIPELINE_ALPHA_TEST_BIT : 0);
 	else
-	{
-		// polygonMode = VK_POLYGON_MODE_LINE;
-		// blendEnable = VK_FALSE;
-		//
-		//  showtris == 1
-		//  depthTestEnable = VK_FALSE;
-		//  depthWriteEnable = VK_FALSE;
-		//  depthBiasEnable = VK_FALSE;
-		//
-		//  showtris >= 2
-		//  depthTestEnable = VK_FALSE => VK_TRUE;
-		//  depthWriteEnable = VK_FALSE;
-		//  depthBiasEnable = VK_FALSE => VK_TRUE;
-		pipeline_index = (3 + CLAMP (1, showtris, 2));
-	}
+		pipeline_index = (showtris >= 2) ? MODEL_PIPELINE_SHOWTRIS_DEPTH_TEST : MODEL_PIPELINE_SHOWTRIS;
 
-	const qboolean use_wboit_pipeline = (cbx->render_pass_index == RENDER_PASS_INDEX_WBOIT) && showtris == 0 && has_alpha;
-	if (cbx->render_pass_index == RENDER_PASS_INDEX_WBOIT && !use_wboit_pipeline)
+	const qboolean oit_pass = cbx->render_pass_index == RENDER_PASS_INDEX_WBOIT || cbx->render_pass_index == RENDER_PASS_INDEX_MBOIT_MOMENTS ||
+							  cbx->render_pass_index == RENDER_PASS_INDEX_MBOIT_COMPOSITE;
+	if (oit_pass && (showtris != 0 || !has_alpha))
 		return;
 
-	switch (paliashdr->poseverttype)
+	if (paliashdr->poseverttype == PV_MD5 || paliashdr->poseverttype == PV_MD5_8)
 	{
-	case PV_MD5:
-		pipeline = use_wboit_pipeline ? vulkan_globals.md5_wboit_pipelines[pipeline_index]
-									  : vulkan_globals.md5_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index];
-		break;
-	case PV_QUAKE1:
-		pipeline = use_wboit_pipeline ? vulkan_globals.alias_wboit_pipelines[pipeline_index]
-									  : vulkan_globals.alias_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index];
-		break;
-	case PV_QUAKE3:
-		pipeline = use_wboit_pipeline ? vulkan_globals.alias_wboit_pipelines[pipeline_index]
-									  : vulkan_globals.alias_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index];
-		break;
-	default:
-		pipeline = use_wboit_pipeline ? vulkan_globals.alias_wboit_pipelines[pipeline_index]
-									  : vulkan_globals.alias_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index];
+		vulkan_pipeline_t (*pipelines)[MODEL_PIPELINE_COUNT] =
+			(paliashdr->poseverttype == PV_MD5_8) ? vulkan_globals.md5_8_pipelines : vulkan_globals.md5_pipelines;
+		vulkan_pipeline_t *wboit_pipelines = (paliashdr->poseverttype == PV_MD5_8) ? vulkan_globals.md5_8_wboit_pipelines : vulkan_globals.md5_wboit_pipelines;
+		vulkan_pipeline_t *mboit_moment_pipelines =
+			(paliashdr->poseverttype == PV_MD5_8) ? vulkan_globals.md5_8_mboit_moment_pipelines : vulkan_globals.md5_mboit_moment_pipelines;
+		vulkan_pipeline_t *mboit_composite_pipelines =
+			(paliashdr->poseverttype == PV_MD5_8) ? vulkan_globals.md5_8_mboit_composite_pipelines : vulkan_globals.md5_mboit_composite_pipelines;
+
+		pipeline = R_PipelineForRenderPass (
+			cbx->render_pass_index, pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index], wboit_pipelines[pipeline_index],
+			mboit_moment_pipelines[pipeline_index], mboit_composite_pipelines[pipeline_index]);
 	}
+	else
+		pipeline = R_PipelineForRenderPass (
+			cbx->render_pass_index, vulkan_globals.alias_pipelines[R_MainPassPipelineVariant (cbx->render_pass_index)][pipeline_index],
+			vulkan_globals.alias_wboit_pipelines[pipeline_index], vulkan_globals.alias_mboit_moment_pipelines[pipeline_index],
+			vulkan_globals.alias_mboit_composite_pipelines[pipeline_index]);
 
 	R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 
@@ -244,6 +207,7 @@ static void GL_DrawAliasFrame (
 		break;
 	}
 	case PV_MD5:
+	case PV_MD5_8:
 	{
 		VkBuffer		uniform_buffer;
 		uint32_t		uniform_offset;
@@ -281,95 +245,76 @@ static void GL_DrawAliasFrame (
 
 /*
 =================
-R_UpdateEntityAnimState
+R_EntityPoseAt
 
-Updates entity animation state (previouspose, currentpose, lerpstart, lerptime).
-Call once per frame when entity becomes visible, before R_SetupAliasFrame.
+Pose displayed by the given model frame at the given time (framegroup poses
+advance with time).
 =================
 */
-void R_UpdateEntityAnimState (entity_t *e, aliashdr_t *paliashdr)
+static int R_EntityPoseAt (aliashdr_t *paliashdr, int frame, double time)
 {
-	int frame = e->frame;
 	if ((frame >= paliashdr->numframes) || (frame < 0))
 		frame = 0;
 
 	int posenum = paliashdr->frames[frame].firstpose;
 	int numposes = paliashdr->frames[frame].numposes;
-
 	if (numposes > 1)
-	{
-		e->lerptime = paliashdr->frames[frame].interval;
-		posenum += (int)(cl.time / e->lerptime) % numposes;
-	}
-	else
-		e->lerptime = 0.1;
-
-	if (e->lerpflags & LERP_RESETANIM)
-	{
-		e->lerpstart = 0;
-		e->previouspose = posenum;
-		e->currentpose = posenum;
-		e->lerpflags -= LERP_RESETANIM;
-	}
-	else if (e->currentpose != posenum)
-	{
-		if (e->lerpflags & LERP_RESETANIM2)
-		{
-			e->lerpstart = 0;
-			e->previouspose = posenum;
-			e->currentpose = posenum;
-			e->lerpflags -= LERP_RESETANIM2;
-		}
-		else
-		{
-			e->lerpstart = cl.time;
-			e->previouspose = e->currentpose;
-			e->currentpose = posenum;
-		}
-	}
-
-	// Check blend==1 and snap previouspose
-	if (r_lerpmodels.value && !(e->model->flags & MOD_NOLERP && r_lerpmodels.value != 2))
-	{
-		float blend;
-		if (e->lerpflags & LERP_FINISH && numposes == 1)
-			blend = CLAMP (0, (cl.time - e->lerpstart) / (e->lerpfinish - e->lerpstart), 1);
-		else
-			blend = CLAMP (0, (cl.time - e->lerpstart) / e->lerptime, 1);
-
-		if (blend == 1.0f)
-			e->previouspose = e->currentpose;
-	}
+		posenum += (int)(time / paliashdr->frames[frame].interval) % numposes;
+	return posenum;
 }
 
 /*
 =================
 R_SetupAliasFrame -- johnfitz -- rewritten to support lerping
 
-Computes output lerp data from stable entity animation state.
-Call R_UpdateEntityAnimState first to update entity state.
+Computes pose1/pose2/blend from the parse-side interpolation state and
+cl.time. Does not modify the entity.
 =================
 */
-void R_SetupAliasFrame (entity_t *e, aliashdr_t *paliashdr, int frame, lerpdata_t *lerpdata)
+void R_SetupAliasFrame (const entity_t *e, aliashdr_t *paliashdr, lerpdata_t *lerpdata)
 {
+	int frame = e->frame;
 	if ((frame >= paliashdr->numframes) || (frame < 0))
 		frame = 0;
 
-	int posenum = paliashdr->frames[frame].firstpose;
-	int numposes = paliashdr->frames[frame].numposes;
-
-	if (numposes > 1)
-		posenum += (int)(cl.time / e->lerptime) % numposes;
-
 	if (r_lerpmodels.value && !(e->model->flags & MOD_NOLERP && r_lerpmodels.value != 2))
 	{
-		if (e->lerpflags & LERP_FINISH && numposes == 1)
-			lerpdata->blend = CLAMP (0, (cl.time - e->lerpstart) / (e->lerpfinish - e->lerpstart), 1);
-		else
-			lerpdata->blend = CLAMP (0, (cl.time - e->lerpstart) / e->lerptime, 1);
+		int	   numposes = paliashdr->frames[frame].numposes;
+		double change_time = e->lerp.frame_change_time;
 
-		lerpdata->pose1 = e->previouspose;
-		lerpdata->pose2 = e->currentpose;
+		if (numposes > 1)
+		{
+			// framegroup: poses advance with cl.time; lerp from the previous
+			// group pose unless the entity entered this frame more recently
+			double interval = paliashdr->frames[frame].interval;
+			int	   idx = (int)(cl.time / interval);
+			double boundary = idx * interval;
+
+			lerpdata->pose2 = paliashdr->frames[frame].firstpose + idx % numposes;
+			if (change_time > boundary)
+			{
+				lerpdata->pose1 = R_EntityPoseAt (paliashdr, e->lerp.prev_frame, change_time);
+				lerpdata->blend = CLAMP (0, (cl.time - change_time) / interval, 1);
+			}
+			else
+			{
+				lerpdata->pose1 = paliashdr->frames[frame].firstpose + (idx + numposes - 1) % numposes;
+				lerpdata->blend = CLAMP (0, (cl.time - boundary) / interval, 1);
+			}
+		}
+		else if (change_time > 0)
+		{
+			double duration = (e->lerp.frame_duration > 0) ? e->lerp.frame_duration : 0.1;
+			lerpdata->pose2 = paliashdr->frames[frame].firstpose;
+			lerpdata->pose1 = R_EntityPoseAt (paliashdr, e->lerp.prev_frame, change_time);
+			lerpdata->blend = CLAMP (0, (cl.time - change_time) / duration, 1);
+		}
+		else
+		{
+			lerpdata->pose2 = paliashdr->frames[frame].firstpose;
+			lerpdata->pose1 = lerpdata->pose2;
+			lerpdata->blend = 1;
+		}
 
 		// Clamp poses (safety check for Quake1 models)
 		if (paliashdr->poseverttype == PV_QUAKE1)
@@ -385,7 +330,7 @@ void R_SetupAliasFrame (entity_t *e, aliashdr_t *paliashdr, int frame, lerpdata_
 				lerpdata->pose1 = lerpdata->pose2;
 			}
 		}
-		else if (paliashdr->poseverttype == PV_MD5)
+		else if (paliashdr->poseverttype == PV_MD5 || paliashdr->poseverttype == PV_MD5_8)
 		{
 			// MD5 uses numframes for joint matrices
 			if (lerpdata->pose1 >= paliashdr->numframes || lerpdata->pose1 < 0)
@@ -397,39 +342,8 @@ void R_SetupAliasFrame (entity_t *e, aliashdr_t *paliashdr, int frame, lerpdata_
 	else
 	{
 		lerpdata->blend = 1;
-		lerpdata->pose1 = posenum;
-		lerpdata->pose2 = posenum;
-	}
-}
-
-/*
-=================
-R_UpdateEntityMoveState
-
-Updates entity movement state (previousorigin, currentorigin, etc.).
-Call once per frame when entity becomes visible, before R_GetEntityLerpedTransform.
-=================
-*/
-void R_UpdateEntityMoveState (entity_t *e)
-{
-	// if LERP_RESETMOVE, kill any lerps in progress
-	if (e->lerpflags & LERP_RESETMOVE)
-	{
-		e->movelerpstart = 0;
-		VectorCopy (e->origin, e->previousorigin);
-		VectorCopy (e->origin, e->currentorigin);
-		VectorCopy (e->angles, e->previousangles);
-		VectorCopy (e->angles, e->currentangles);
-		e->lerpflags -= LERP_RESETMOVE;
-	}
-	else if (!VectorCompare (e->origin, e->currentorigin) || (r_lerpturn.value && !VectorCompare (e->angles, e->currentangles)))
-	{
-		// origin/angles changed, start new lerp
-		e->movelerpstart = cl.time;
-		VectorCopy (e->currentorigin, e->previousorigin);
-		VectorCopy (e->origin, e->currentorigin);
-		VectorCopy (e->currentangles, e->previousangles);
-		VectorCopy (e->angles, e->currentangles);
+		lerpdata->pose1 = R_EntityPoseAt (paliashdr, frame, cl.time);
+		lerpdata->pose2 = lerpdata->pose1;
 	}
 }
 
@@ -437,31 +351,32 @@ void R_UpdateEntityMoveState (entity_t *e)
 =================
 R_GetEntityLerpedTransform
 
-Computes lerped origin/angles from stable entity state.
-Call R_UpdateEntityMoveState first to update entity state.
+Computes lerped origin/angles from the parse-side interpolation state and
+cl.time. Does not modify the entity.
+
+Attached entities (tagentity) use their post-attachment origin/angles, which
+only exist on the entity itself.
 =================
 */
-void R_GetEntityLerpedTransform (entity_t *e, vec3_t out_origin, vec3_t out_angles)
+void R_GetEntityLerpedTransform (const entity_t *e, vec3_t out_origin, vec3_t out_angles)
 {
-	if (r_lerpmove.value && e != &cl.viewent && e->lerpflags & LERP_MOVESTEP)
+	if (r_lerpmove.value && e != &cl.viewent && e->lerp.movestep && !e->netstate.tagentity && e->lerp.move_change_time > 0)
 	{
-		float blend;
-		if (e->lerpflags & LERP_FINISH)
-			blend = CLAMP (0, (cl.time - e->movelerpstart) / (e->lerpfinish - e->movelerpstart), 1);
-		else
-			blend = CLAMP (0, (cl.time - e->movelerpstart) / 0.1, 1);
+		double change_time = e->lerp.move_change_time;
+		double duration = (e->lerp.move_duration > 0) ? e->lerp.move_duration : 0.1;
+		float  blend = CLAMP (0, (cl.time - change_time) / duration, 1);
 
 		// translation
 		vec3_t d;
-		VectorSubtract (e->currentorigin, e->previousorigin, d);
-		out_origin[0] = e->previousorigin[0] + d[0] * blend;
-		out_origin[1] = e->previousorigin[1] + d[1] * blend;
-		out_origin[2] = e->previousorigin[2] + d[2] * blend;
+		VectorSubtract (e->msg_origins[0], e->lerp.prev_origin, d);
+		out_origin[0] = e->lerp.prev_origin[0] + d[0] * blend;
+		out_origin[1] = e->lerp.prev_origin[1] + d[1] * blend;
+		out_origin[2] = e->lerp.prev_origin[2] + d[2] * blend;
 
-		// rotation (if enabled)
-		if (r_lerpturn.value)
+		// rotation (if enabled); EF_ROTATE angles are client-side and only exist on the entity
+		if (r_lerpturn.value && !(e->model->flags & EF_ROTATE))
 		{
-			VectorSubtract (e->currentangles, e->previousangles, d);
+			VectorSubtract (e->msg_angles[0], e->lerp.prev_angles, d);
 			for (int i = 0; i < 3; i++)
 			{
 				if (d[i] > 180)
@@ -469,9 +384,9 @@ void R_GetEntityLerpedTransform (entity_t *e, vec3_t out_origin, vec3_t out_angl
 				if (d[i] < -180)
 					d[i] += 360;
 			}
-			out_angles[0] = e->previousangles[0] + d[0] * blend;
-			out_angles[1] = e->previousangles[1] + d[1] * blend;
-			out_angles[2] = e->previousangles[2] + d[2] * blend;
+			out_angles[0] = e->lerp.prev_angles[0] + d[0] * blend;
+			out_angles[1] = e->lerp.prev_angles[1] + d[1] * blend;
+			out_angles[2] = e->lerp.prev_angles[2] + d[2] * blend;
 		}
 		else
 		{
@@ -512,7 +427,40 @@ static void R_SetupAliasLighting (entity_t *e, vec3_t *shadevector, vec3_t *ligh
 			VectorSubtract (e->origin, cl_dlights[i].origin, dist);
 			add = cl_dlights[i].radius - VectorLength (dist);
 			if (add > 0)
+			{
+				if (cl_dlights[i].cone_cos > -1.0f)
+				{
+					vec3_t dir;
+					VectorCopy (dist, dir);
+					VectorNormalize (dir);
+					const float cone_cos = cl_dlights[i].cone_cos;
+					const float cone_dot = DotProduct (dir, cl_dlights[i].cone_dir);
+					float		cone_scale;
+					if (cl_dlights[i].kex_intensity > 0.0f)
+					{
+						// linear falloff from cone axis to edge, matches update_lightmap.inc
+						if (cone_dot < cone_cos)
+							continue;
+						cone_scale = 1.0f - (1.0f - cone_dot) / (1.0f - cone_cos);
+					}
+					else
+					{
+						// soft edged spotlight falloff, matches update_lightmap.inc
+						const float cone_soft = cone_cos + ((1.0f - cone_cos) * 0.25f);
+						cone_scale = CLAMP (0.0f, (cone_dot - cone_cos) / q_max (cone_soft - cone_cos, 0.0001f), 1.0f);
+					}
+					add *= cone_scale;
+					if (add <= 0.0f)
+						continue;
+				}
+				if (cl_dlights[i].kex_intensity > 0.0f)
+				{
+					// KEX falloff: range-normalized, scaled by intensity (matches update_lightmap.inc,
+					// sans the Lambert term since alias models use their own shading)
+					add *= cl_dlights[i].kex_intensity * 0.5f * (256.0f / cl_dlights[i].radius);
+				}
 				VectorMA (*lightcolor, add, cl_dlights[i].color, *lightcolor);
+			}
 		}
 	}
 
@@ -578,7 +526,7 @@ void R_DrawAliasModel (cb_context_t *cbx, entity_t *e, int *aliaspolys)
 
 	qboolean alphatest = !!(e->model->flags & MF_HOLEY);
 
-	R_SetupAliasFrame (e, paliashdr, e->frame, &lerpdata);
+	R_SetupAliasFrame (e, paliashdr, &lerpdata);
 	R_GetEntityLerpedTransform (e, lerpdata.origin, lerpdata.angles);
 
 	//
@@ -706,7 +654,7 @@ void R_DrawAliasModel_ShowTris (cb_context_t *cbx, entity_t *e)
 	//
 	paliashdr = (aliashdr_t *)Mod_Extradata_CheckSkin (e->model, e->skinnum);
 
-	R_SetupAliasFrame (e, paliashdr, e->frame, &lerpdata);
+	R_SetupAliasFrame (e, paliashdr, &lerpdata);
 	R_GetEntityLerpedTransform (e, lerpdata.origin, lerpdata.angles);
 
 	//
@@ -744,4 +692,75 @@ void R_DrawAliasModel_ShowTris (cb_context_t *cbx, entity_t *e)
 	{
 		GL_DrawAliasFrame (cbx, e, hdr, lerpdata, nulltexture, nulltexture, model_matrix, 0.0f, false, shadevector, lightcolor, r_showtris.value);
 	}
+}
+
+/*
+=================
+R_DrawAliasModel_ShowSkel
+=================
+*/
+void R_DrawAliasModel_ShowSkel (cb_context_t *cbx, entity_t *e)
+{
+	aliashdr_t *paliashdr;
+	lerpdata_t	lerpdata;
+
+	paliashdr = (aliashdr_t *)Mod_Extradata_CheckSkin (e->model, e->skinnum);
+	if ((paliashdr->poseverttype != PV_MD5 && paliashdr->poseverttype != PV_MD5_8) || paliashdr->skeleton_index_buffer == VK_NULL_HANDLE ||
+		paliashdr->num_skeleton_indexes <= 0 || paliashdr->joints_set == VK_NULL_HANDLE)
+		return;
+
+	R_SetupAliasFrame (e, paliashdr, &lerpdata);
+	R_GetEntityLerpedTransform (e, lerpdata.origin, lerpdata.angles);
+
+	if (R_CullModelForEntity (e))
+		return;
+
+	float model_matrix[16];
+	IdentityMatrix (model_matrix);
+	R_RotateForEntity (model_matrix, lerpdata.origin, lerpdata.angles, e->netstate.scale);
+
+	float fovscale = 1.0f;
+	if (e == &cl.viewent && r_refdef.basefov > 90.f)
+	{
+		fovscale = tan (r_refdef.basefov * (0.5f * M_PI / 180.f));
+		fovscale = 1.f + (fovscale - 1.f) * cl_gun_fovscale.value;
+	}
+
+	float translation_matrix[16];
+	TranslationMatrix (translation_matrix, paliashdr->scale_origin[0], paliashdr->scale_origin[1] * fovscale, paliashdr->scale_origin[2] * fovscale);
+	MatrixMultiply (model_matrix, translation_matrix);
+
+	float scale_matrix[16];
+	ScaleMatrix (scale_matrix, paliashdr->scale[0], paliashdr->scale[1] * fovscale, paliashdr->scale[2] * fovscale);
+	MatrixMultiply (model_matrix, scale_matrix);
+
+	float blend = 0.0f;
+	if (lerpdata.pose1 != lerpdata.pose2)
+		blend = lerpdata.blend;
+
+	VkBuffer		uniform_buffer;
+	uint32_t		uniform_offset;
+	VkDescriptorSet ubo_set;
+	md5ubo_t	   *ubo = (md5ubo_t *)R_UniformAllocate (sizeof (md5ubo_t), &uniform_buffer, &uniform_offset, &ubo_set);
+
+	memcpy (ubo->model_matrix, model_matrix, 16 * sizeof (float));
+	ubo->shade_vector[0] = 0.0f;
+	ubo->shade_vector[1] = 0.0f;
+	ubo->shade_vector[2] = 0.0f;
+	ubo->blend_factor = blend;
+	ubo->light_color[0] = 1.0f;
+	ubo->light_color[1] = 1.0f;
+	ubo->light_color[2] = 0.0f;
+	ubo->entalpha = 1.0f;
+	ubo->flags = 0;
+	ubo->joints_offsets[0] = lerpdata.pose1 * paliashdr->numjoints;
+	ubo->joints_offsets[1] = lerpdata.pose2 * paliashdr->numjoints;
+
+	vulkan_pipeline_t pipeline = vulkan_globals.md5_debug_pipeline[R_MainPassPipelineVariant (cbx->render_pass_index)];
+	R_BindPipeline (cbx, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+
+	VkDescriptorSet descriptor_sets[2] = {ubo_set, paliashdr->joints_set};
+	vulkan_globals.vk_cmd_bind_descriptor_sets (cbx->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline.layout.handle, 2, 2, descriptor_sets, 1, &uniform_offset);
+	vulkan_globals.vk_cmd_bind_index_buffer (cbx->cb, paliashdr->skeleton_index_buffer, 0, VK_INDEX_TYPE_UINT16);
+	vulkan_globals.vk_cmd_draw_indexed (cbx->cb, paliashdr->num_skeleton_indexes, 1, 0, 0, 0);
 }

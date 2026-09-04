@@ -62,6 +62,9 @@ void SV_LinkEdict (edict_t *ent, qboolean touch_triggers);
 // sets ent->v.absmin and ent->v.absmax
 // if touchtriggers, calls prog functions for the intersected triggers
 
+void SV_PushGridEntityLinked (edict_t *ent);
+// sv_phys.c: keeps the SV_PushMove spatial grid in sync with entities that move mid-tick
+
 int SV_PointContentsAllBsps (vec3_t p, edict_t *forent); // check all SOLID_BSP ents
 int SV_PointContents (vec3_t p);
 int SV_TruePointContents (vec3_t p);
@@ -75,6 +78,19 @@ edict_t *SV_TestEntityPosition (edict_t *ent);
 #define CONTENTMASK_ANYSOLID  (CONTENTMASK_FROMQ1 (CONTENTS_SOLID) | CONTENTMASK_FROMQ1 (CONTENTS_CLIP))
 trace_t SV_ClipMoveToEntity (edict_t *ent, vec3_t start, vec3_t mins, vec3_t maxs, vec3_t end, unsigned int hitcontents);
 trace_t SV_Move (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t end, int type, edict_t *passedict);
+// Entities a move should not clip against, as a list rather than a per-edict
+// array: nothing to allocate or clear between moves. A big elevator can carry
+// hundreds of riders, so `riders` is binary searched and must be sorted
+// ascending by pointer. The pusher is held separately because it is not a rider
+// and would otherwise need inserting into that order.
+typedef struct
+{
+	edict_t **riders; /* caller owned, sorted ascending, may be NULL */
+	int		  num_riders;
+	edict_t	 *pusher; /* may be NULL */
+} sv_ignore_edicts_t;
+
+trace_t SV_MoveWithEdictIgnoreMask (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t end, int type, edict_t *passedict, const sv_ignore_edicts_t *ignore_edicts);
 // mins and maxs are reletive
 
 // if the entire move stays in a solid volume, trace.allsolid will be set
@@ -90,6 +106,9 @@ trace_t SV_Move (vec3_t start, vec3_t mins, vec3_t maxs, vec3_t end, int type, e
 int SV_HullPointContents (hull_t *hull, int num, vec3_t p);
 
 qboolean SV_RecursiveHullCheck (hull_t *hull, vec3_t p1, vec3_t p2, trace_t *trace, unsigned int hitcontents);
+byte	*SV_FatPVS (vec3_t org, qmodel_t *worldmodel);
+qboolean SV_EdictInPVS (edict_t *test, byte *pvs);
+qboolean SV_BoxInPVS (vec3_t mins, vec3_t maxs, byte *pvs, qmodel_t *worldmodel);
 
 enum
 {

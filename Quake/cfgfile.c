@@ -27,7 +27,7 @@ static fshandle_t *cfg_file;
 ===================
 CFG_ReadCvars
 
-used for doing early reads from config.cfg searching the list
+used for doing early reads from the config file searching the list
 of given cvar names for the user-set values. a temporary
 solution until we merge a better cvar system.
 the num_vars argument must be the exact number of strings in the
@@ -152,27 +152,26 @@ void CFG_CloseConfig (void)
 
 int CFG_OpenConfig (const char *cfg_name)
 {
-	FILE	*f = NULL;
-	long	 length;
-	qboolean pak = false;
+	FILE	   *f = NULL;
+	qfilesize_t length;
+	qboolean	pak = false;
 
 	CFG_CloseConfig ();
 
-	if (multiuser)
+	if (!q_strcasecmp (cfg_name, CONFIG_NAME))
 	{
-		char *pref_path = SDL_GetPrefPath ("", "vkQuake");
-		f = fopen (va ("%s/config.cfg", pref_path), "rb");
-		SDL_free (pref_path);
+		f = COM_FOpenConfigFile (true, "rb");
+		if (!f)
+			return -1;
 	}
+
 	if (f)
 	{
-		fseek (f, 0, SEEK_END);
-		length = ftell (f);
-		fseek (f, 0, SEEK_SET);
+		length = Sys_filelength (f);
 	}
 	else
 	{
-		length = (long)COM_FOpenFile (cfg_name, &f, NULL);
+		length = COM_FOpenFile (cfg_name, &f, NULL);
 		pak = file_from_pak;
 		if (length == -1)
 			return -1;
@@ -180,7 +179,7 @@ int CFG_OpenConfig (const char *cfg_name)
 
 	cfg_file = (fshandle_t *)Mem_Alloc (sizeof (fshandle_t));
 	cfg_file->file = f;
-	cfg_file->start = ftell (f);
+	cfg_file->start = Sys_ftell (f);
 	cfg_file->pos = 0;
 	cfg_file->length = length;
 	cfg_file->pak = pak;

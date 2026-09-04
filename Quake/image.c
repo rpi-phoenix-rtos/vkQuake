@@ -23,8 +23,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include "quakedef.h"
 
-static byte *Image_LoadPCX (FILE *f, int *width, int *height);
-static byte *Image_LoadLMP (FILE *f, int *width, int *height);
+static byte *Image_LoadPCX (int file_handle, int *width, int *height, const char *image_name);
+static byte *Image_LoadLMP (int file_handle, int *width, int *height, const char *image_name);
 
 #ifdef _MSC_VER
 // Disable warning C4505: Unused functions
@@ -48,6 +48,7 @@ static byte *Image_LoadLMP (FILE *f, int *width, int *height);
 #define STBI_NO_PIC
 #define STBI_NO_PNM
 #define STBI_NO_LINEAR
+#define STBI_NO_STDIO
 // plug our Mem_Alloc in stb_image:
 #define STBI_MALLOC(sz)		   Mem_Alloc (sz)
 #define STBI_REALLOC(p, newsz) Mem_Realloc (p, newsz)
@@ -66,6 +67,7 @@ static byte *Image_LoadLMP (FILE *f, int *width, int *height);
 // STB_IMAGE_WRITE config:
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
+#define STBI_WRITE_NO_STDIO		// all file output goes through Sys_fopen
 // plug our Mem_Alloc in stb_image_write:
 #define STBIW_MALLOC(sz)		Mem_Alloc (sz)
 #define STBIW_REALLOC(p, newsz) Mem_Realloc (p, newsz)
@@ -96,121 +98,130 @@ void lodepng_free (void *ptr)
 	Mem_Free (ptr);
 }
 
-static THREAD_LOCAL char loadfilename[MAX_OSPATH]; // file scope so that error messages can use it
-
-typedef struct stdio_buffer_s
+static int stbi_read_cb (void *user, char *data, int size)
 {
-	FILE		 *f;
-	unsigned char buffer[1024];
-	int			  size;
-	int			  pos;
-} stdio_buffer_t;
+	int *file_handle = (int *)user;
 
-static stdio_buffer_t *Buf_Alloc (FILE *f)
-{
-	stdio_buffer_t *buf = (stdio_buffer_t *)Mem_Alloc (sizeof (stdio_buffer_t));
-	buf->f = f;
-	return buf;
+	return Sys_FileRead (*file_handle, (void *)data, size);
 }
 
-static void Buf_Free (stdio_buffer_t *buf)
+static void stbi_skip_cb (void *user, int n)
 {
-	Mem_Free (buf);
-}
+	int *file_handle = (int *)user;
 
-static inline int Buf_GetC (stdio_buffer_t *buf)
-{
-	if (buf->pos >= buf->size)
+	qfileofs_t current_pos = Sys_FilePos (*file_handle);
+
+	qfileofs_t new_pos = current_pos + n;
+
+	// mimic default stbi__stdio_skip() :
+	Sys_FileSeek (*file_handle, new_pos);
+
+	if (Sys_fgetc (*file_handle) != EOF)
 	{
-		buf->size = fread (buf->buffer, 1, sizeof (buf->buffer), buf->f);
-		buf->pos = 0;
-
-		if (buf->size == 0)
-			return EOF;
+		Sys_FileSeek (*file_handle, new_pos);
 	}
+}
 
-	return buf->buffer[buf->pos++];
+static int stbi_eof_cb (void *user)
+{
+	int *file_handle = (int *)user;
+
+	return (int)Sys_feof (*file_handle);
 }
 
 /*
 ============
 Image_LoadImage
+of an image filename 'name' (with no extension)
 either returns a pointer to Mem_Alloc allocated RGBA data
 or returns NULL if not loaded, either because not found OR if name
 is ignored because from a gamedir with lower priority than min_path_id.
 Use min_path_id = 0 if gamedir priority is N/A.
 Search order:  png tga jpg pcx lmp
-Note : makes a thread-safe copy of 'name' so ve can use va() as inuput.
+Note : makes a thread-safe copy of 'name' so we can use va() as inuput.
 ============
 */
+// image formats supported, ordered by priority
+typedef enum
+{
+	STB_IMAGE_LOADER,
+	PCX_LOADER,
+	LMP_LOADER
+} image_loader_t;
+
+static struct
+{
+	const char	  *file_extension;
+	image_loader_t loader;
+} supported_image_formats[] = {{"png", STB_IMAGE_LOADER}, {"tga", STB_IMAGE_LOADER}, {"jpg", STB_IMAGE_LOADER}, {"pcx", PCX_LOADER}, {"lmp", LMP_LOADER}};
+
+const int num_supported_image_formats = countof (supported_image_formats);
+
 byte *Image_LoadImage (const char *name, int *width, int *height, enum srcformat *fmt, unsigned int min_path_id)
 {
-	static const char *const stbi_formats[] = {"png", "tga", "jpg", NULL};
+	// 1. Search 'name' image by supported_image_formats, keeping only the best, as:
+	// a) The highest path_id wins,
+	// b) For equivalent path_id, Highest supported_image_formats[] priority wins. (smallest index)
+	int			 best_path_id = -1;
+	unsigned int path_id = 0;
+	int			 best_image_kind_index = -1;
+	char		 loadfilename[MAX_OSPATH];
+	int			 file_handle = -1;
 
-	FILE *f;
-	int	  i;
-
-	unsigned int opened_file_path_id = 0;
-
-	for (i = 0; stbi_formats[i]; i++)
+	for (int image_kind_index = 0; image_kind_index < num_supported_image_formats; image_kind_index++)
 	{
-		q_snprintf (loadfilename, sizeof (loadfilename), "%s.%s", name, stbi_formats[i]);
-		COM_FOpenFile (loadfilename, &f, &opened_file_path_id);
+		q_snprintf (loadfilename, sizeof (loadfilename), "%s.%s", name, supported_image_formats[image_kind_index].file_extension);
 
-		if (f)
+		if (COM_FileExists (loadfilename, &path_id))
 		{
-			if (opened_file_path_id >= min_path_id)
+			if ((int)path_id > best_path_id)
 			{
-				// data is managed by our Mem_Alloc routines, nothing more to do.
-				byte *data = stbi_load_from_file (f, width, height, NULL, 4);
-
-				if (data)
-				{
-					*fmt = SRC_RGBA;
-				}
-				else
-					Con_Warning ("couldn't load %s (%s)\n", loadfilename, stbi_failure_reason ());
-				fclose (f);
-				return data;
-			}
-			else
-			{
-				Con_DPrintf ("Image_LoadImage: ignored %s from a gamedir with lower priority\n", loadfilename);
-				fclose (f);
+				best_path_id = (int)path_id;
+				best_image_kind_index = image_kind_index;
 			}
 		}
 	}
 
-	q_snprintf (loadfilename, sizeof (loadfilename), "%s.pcx", name);
-	COM_FOpenFile (loadfilename, &f, &opened_file_path_id);
-	if (f)
+	// at that point, best_image_kind_index points on the highest path_id image,
+	// or in case of path_id equality, the best format in terms of priority.
+	// min_path_id is the final barrier of entry:
+	// if no file was found, this is also used to bail out. (best_path_id  = -1 < min_path_id ( = 0))
+	if (best_path_id < (int)min_path_id)
+		return NULL;
+
+	// 2. Load image matching supported_image_formats[best_image_kind_index].file_extension
+	q_snprintf (loadfilename, sizeof (loadfilename), "%s.%s", name, supported_image_formats[best_image_kind_index].file_extension);
+
+	COM_OpenFile (loadfilename, &file_handle, NULL);
+
+	assert (file_handle >= 0);
+
+	if (supported_image_formats[best_image_kind_index].loader == STB_IMAGE_LOADER)
 	{
-		if (opened_file_path_id >= min_path_id)
+		stbi_io_callbacks sys_file_cb = {.read = stbi_read_cb, .eof = stbi_eof_cb, .skip = stbi_skip_cb};
+
+		// data is managed by our Mem_Alloc routines, nothing more to do.
+		byte *data = stbi_load_from_callbacks (&sys_file_cb, (void *)&file_handle, width, height, NULL, 4);
+
+		if (data)
 		{
 			*fmt = SRC_RGBA;
-			return Image_LoadPCX (f, width, height);
 		}
 		else
-		{
-			Con_DPrintf ("Image_LoadImage: ignored %s from a gamedir with lower priority\n", loadfilename);
-			fclose (f);
-		}
-	}
+			Con_Warning ("couldn't load %s (%s)\n", loadfilename, stbi_failure_reason ());
 
-	q_snprintf (loadfilename, sizeof (loadfilename), "%s%s.lmp", "", name);
-	COM_FOpenFile (loadfilename, &f, &opened_file_path_id);
-	if (f)
+		COM_CloseFile (file_handle);
+		return data;
+	}
+	else if (supported_image_formats[best_image_kind_index].loader == PCX_LOADER)
 	{
-		if (opened_file_path_id >= min_path_id)
-		{
-			*fmt = SRC_INDEXED;
-			return Image_LoadLMP (f, width, height);
-		}
-		else
-		{
-			Con_DPrintf ("Image_LoadImage: ignored %s from a gamedir with lower priority\n", loadfilename);
-			fclose (f);
-		}
+		*fmt = SRC_RGBA;
+		return Image_LoadPCX (file_handle, width, height, loadfilename);
+	}
+	else if (supported_image_formats[best_image_kind_index].loader == LMP_LOADER)
+	{
+		*fmt = SRC_INDEXED;
+		return Image_LoadLMP (file_handle, width, height, loadfilename);
 	}
 
 	return NULL;
@@ -237,7 +248,6 @@ qboolean Image_WriteTGA (const char *name, byte *data, int width, int height, in
 	char pathname[MAX_OSPATH];
 	byte header[TARGAHEADERSIZE];
 
-	Sys_mkdir (com_gamedir); // if we've switched to a nonexistant gamedir, create it now so we don't crash
 	q_snprintf (pathname, sizeof (pathname), "%s/%s", com_gamedir, name);
 	handle = Sys_FileOpenWrite (pathname);
 	if (handle == -1)
@@ -297,18 +307,21 @@ typedef struct
 Image_LoadPCX
 ============
 */
-static byte *Image_LoadPCX (FILE *f, int *width, int *height)
+static byte *Image_LoadPCX (int file_handle, int *width, int *height, const char *image_name)
 {
-	pcxheader_t		pcx;
-	int				x, y, w, h, readbyte, runlength, start;
-	byte		   *p, *data;
-	byte			palette[768];
-	stdio_buffer_t *buf;
+	pcxheader_t pcx;
+	int			x, y, w, h, readbyte, runlength;
+	byte	   *p, *data;
+	byte		palette[768];
 
-	start = ftell (f); // save start of file (since we might be inside a pak file, SEEK_SET might not be the start of the pcx)
+	// save start of file since we might be inside a pak file
+	const int start = Sys_FilePos (file_handle);
 
-	if (fread (&pcx, sizeof (pcx), 1, f) != 1)
-		Sys_Error ("'%s' is not a valid PCX file", loadfilename);
+	// We may are in a pak file so that resource size is com_filesize
+	const int file_size = com_filesize;
+
+	if (Sys_FileRead (file_handle, &pcx, sizeof (pcx)) != sizeof (pcx))
+		Sys_Error ("'%s' is not a valid PCX file", image_name);
 
 	pcx.xmin = (unsigned short)LittleShort (pcx.xmin);
 	pcx.ymin = (unsigned short)LittleShort (pcx.ymin);
@@ -317,13 +330,13 @@ static byte *Image_LoadPCX (FILE *f, int *width, int *height)
 	pcx.bytes_per_line = (unsigned short)LittleShort (pcx.bytes_per_line);
 
 	if (pcx.signature != 0x0A)
-		Sys_Error ("'%s' is not a valid PCX file", loadfilename);
+		Sys_Error ("'%s' is not a valid PCX file", image_name);
 
 	if (pcx.version != 5)
-		Sys_Error ("'%s' is version %i, should be 5", loadfilename, pcx.version);
+		Sys_Error ("'%s' is version %i, should be 5", image_name, pcx.version);
 
 	if (pcx.encoding != 1 || pcx.bits_per_pixel != 8 || pcx.color_planes != 1)
-		Sys_Error ("'%s' has wrong encoding or bit depth", loadfilename);
+		Sys_Error ("'%s' has wrong encoding or bit depth", image_name);
 
 	w = pcx.xmax - pcx.xmin + 1;
 	h = pcx.ymax - pcx.ymin + 1;
@@ -331,14 +344,13 @@ static byte *Image_LoadPCX (FILE *f, int *width, int *height)
 	data = (byte *)Mem_Alloc ((w * h + 1) * 4); //+1 to allow reading padding byte on last line
 
 	// load palette
-	fseek (f, start + com_filesize - 768, SEEK_SET);
-	if (fread (palette, 1, 768, f) != 768)
-		Sys_Error ("'%s' is not a valid PCX file", loadfilename);
+	Sys_FileSeek (file_handle, start + file_size - 768);
+
+	if (Sys_FileRead (file_handle, palette, 768) != 768)
+		Sys_Error ("'%s' is not a valid PCX file", image_name);
 
 	// back to start of image data
-	fseek (f, start + sizeof (pcx), SEEK_SET);
-
-	buf = Buf_Alloc (f);
+	Sys_FileSeek (file_handle, start + sizeof (pcx));
 
 	for (y = 0; y < h; y++)
 	{
@@ -346,12 +358,12 @@ static byte *Image_LoadPCX (FILE *f, int *width, int *height)
 
 		for (x = 0; x < (pcx.bytes_per_line);) // read the extra padding byte if necessary
 		{
-			readbyte = Buf_GetC (buf);
+			readbyte = Sys_fgetc (file_handle);
 
 			if (readbyte >= 0xC0)
 			{
 				runlength = readbyte & 0x3F;
-				readbyte = Buf_GetC (buf);
+				readbyte = Sys_fgetc (file_handle);
 			}
 			else
 				runlength = 1;
@@ -368,8 +380,7 @@ static byte *Image_LoadPCX (FILE *f, int *width, int *height)
 		}
 	}
 
-	Buf_Free (buf);
-	fclose (f);
+	COM_CloseFile (file_handle);
 
 	*width = w;
 	*height = h;
@@ -392,30 +403,35 @@ typedef struct
 Image_LoadLMP
 ============
 */
-static byte *Image_LoadLMP (FILE *f, int *width, int *height)
+static byte *Image_LoadLMP (int file_handle, int *width, int *height, const char *image_name)
 {
 	lmpheader_t qpic;
 	size_t		pix;
 	void	   *data;
 
-	if (fread (&qpic, 1, sizeof (qpic), f) != sizeof (qpic))
-		Sys_Error ("'%s' is not a valid LMP file", loadfilename);
+	// We may are in a pak file so that resource size is com_filesize
+	const int file_size = com_filesize;
+
+	if (Sys_FileRead (file_handle, &qpic, sizeof (qpic)) != sizeof (qpic))
+		Sys_Error ("'%s' is not a valid LMP file", image_name);
 
 	qpic.width = LittleLong (qpic.width);
 	qpic.height = LittleLong (qpic.height);
 
 	pix = qpic.width * qpic.height;
 
-	if (com_filesize != 8 + pix)
+	if (file_size != 8 + pix)
 	{
-		fclose (f);
+		COM_CloseFile (file_handle);
 		return NULL;
 	}
 
 	data = (byte *)Mem_Alloc (pix); //+1 to allow reading padding byte on last line
-	if (fread (data, 1, pix, f) != pix)
-		Sys_Error ("'%s' is not a valid LMP file", loadfilename);
-	fclose (f);
+
+	if (Sys_FileRead (file_handle, data, pix) != pix)
+		Sys_Error ("'%s' is not a valid LMP file", image_name);
+
+	COM_CloseFile (file_handle);
 
 	*width = qpic.width;
 	*height = qpic.height;
@@ -445,6 +461,13 @@ static byte *CopyFlipped (const byte *data, int width, int height, int bpp)
 	return flipped;
 }
 
+// stbi_write_func that writes to a FILE opened with Sys_fopen, so non-ASCII
+// paths work on Windows (stb's own file output goes through ANSI fopen)
+static void Image_WriteToFileFunc (void *context, void *data, int size)
+{
+	fwrite (data, 1, size, (FILE *)context);
+}
+
 /*
 ============
 Image_WriteJPG -- writes using stb_image_write
@@ -464,7 +487,6 @@ qboolean Image_WriteJPG (const char *name, byte *data, int width, int height, in
 
 	bytes_per_pixel = bpp / 8;
 
-	Sys_mkdir (com_gamedir); // if we've switched to a nonexistant gamedir, create it now so we don't crash
 	q_snprintf (pathname, sizeof (pathname), "%s/%s", com_gamedir, name);
 
 	if (!upsidedown)
@@ -476,7 +498,14 @@ qboolean Image_WriteJPG (const char *name, byte *data, int width, int height, in
 	else
 		flipped = data;
 
-	error = stbi_write_jpg (pathname, width, height, bytes_per_pixel, flipped, quality);
+	FILE *f = Sys_fopen (pathname, "wb");
+	if (f)
+	{
+		error = stbi_write_jpg_to_func (Image_WriteToFileFunc, f, width, height, bytes_per_pixel, flipped, quality);
+		fclose (f);
+	}
+	else
+		error = 0;
 	if (!upsidedown)
 		Mem_Free (flipped);
 
@@ -496,7 +525,6 @@ qboolean Image_WritePNG (const char *name, byte *data, int width, int height, in
 	if (!(bpp == 32 || bpp == 24))
 		Sys_Error ("bpp not 24 or 32");
 
-	Sys_mkdir (com_gamedir); // if we've switched to a nonexistant gamedir, create it now so we don't crash
 	q_snprintf (pathname, sizeof (pathname), "%s/%s", com_gamedir, name);
 
 	flipped = (!upsidedown) ? CopyFlipped (data, width, height, bpp) : data;
@@ -530,7 +558,16 @@ qboolean Image_WritePNG (const char *name, byte *data, int width, int height, in
 
 	error = lodepng_encode (&png, &pngsize, flipped, width, height, &state);
 	if (error == 0)
-		lodepng_save_file (png, pngsize, pathname);
+	{
+		FILE *f = Sys_fopen (pathname, "wb");
+		if (f)
+		{
+			fwrite (png, 1, pngsize, f);
+			fclose (f);
+		}
+		else
+			error = 1;
+	}
 #ifdef LODEPNG_COMPILE_ERROR_TEXT
 	else
 		Con_Printf ("WritePNG: %s\n", lodepng_error_text (error));

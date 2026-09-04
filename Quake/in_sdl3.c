@@ -28,7 +28,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 extern cvar_t in_debugkeys;
 
-static SDL_JoystickID joy_active_instaceid = -1;
+static SDL_JoystickID joy_active_instaceid = 0; // in SDL3, 0 is the invalid joystick ID
 SDL_Gamepad			 *joy_active_controller = NULL;
 
 void IN_StartupJoystick (void)
@@ -126,7 +126,9 @@ void IN_SendKeyEvents (void)
 			S_BlockSound ();
 			VID_FocusLost ();
 			break;
-		case SDL_EVENT_WINDOW_RESIZED:
+		// data1/data2 are in pixels, matching vid.width/height, and this also
+		// fires when only the display scale changes
+		case SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED:
 			vid.width = event.window.data1;
 			vid.height = event.window.data2;
 			vid.restart_next_frame = true;
@@ -168,6 +170,12 @@ void IN_SendKeyEvents (void)
 				Con_Printf ("Ignored event for mouse button %d\n", event.button.button);
 				break;
 			}
+			if (key_dest == key_console)
+			{
+				int x, y;
+				IN_ScaleMouseCoords (event.button.x, event.button.y, &x, &y);
+				Con_Mousemove (x, y);
+			}
 			Key_Event (buttonremap[event.button.button - 1], event.button.down);
 			break;
 
@@ -189,9 +197,9 @@ void IN_SendKeyEvents (void)
 			break;
 
 		case SDL_EVENT_GAMEPAD_ADDED:
-			if (joy_active_instaceid == -1)
+			if (joy_active_instaceid == 0)
 			{
-				joy_active_controller = SDL_OpenGamepad (event.cdevice.which);
+				joy_active_controller = SDL_OpenGamepad (event.gdevice.which);
 				if (joy_active_controller == NULL)
 					Con_DPrintf ("Couldn't open game controller\n");
 				else
@@ -205,11 +213,11 @@ void IN_SendKeyEvents (void)
 				Con_DPrintf ("Ignoring SDL_EVENT_GAMEPAD_ADDED\n");
 			break;
 		case SDL_EVENT_GAMEPAD_REMOVED:
-			if (joy_active_instaceid != -1 && event.cdevice.which == joy_active_instaceid)
+			if (joy_active_instaceid != 0 && event.gdevice.which == joy_active_instaceid)
 			{
 				SDL_CloseGamepad (joy_active_controller);
 				joy_active_controller = NULL;
-				joy_active_instaceid = -1;
+				joy_active_instaceid = 0;
 			}
 			else
 				Con_DPrintf ("Ignoring SDL_EVENT_GAMEPAD_REMOVED\n");
@@ -236,6 +244,12 @@ static bool SDLCALL IN_FilterMouseEvents (const SDL_Event *event)
 	case SDL_EVENT_MOUSE_MOTION:
 		// case SDL_EVENT_MOUSE_BUTTON_DOWN:
 		// case SDL_EVENT_MOUSE_BUTTON_UP:
+		if (key_dest == key_console)
+		{
+			int x, y;
+			IN_ScaleMouseCoords (event->motion.x, event->motion.y, &x, &y);
+			Con_Mousemove (x, y);
+		}
 		return false;
 	}
 

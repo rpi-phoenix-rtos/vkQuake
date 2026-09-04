@@ -46,9 +46,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #ifndef USE_SDL3
 #define SDL_Mutex SDL_mutex
-#define SDL_Mutex SDL_mutex
 
-#define SDL_Condition							SDL_cond
 #define SDL_Condition							SDL_cond
 #define SDL_CreateCondition						SDL_CreateCond
 #define SDL_BroadcastCondition					SDL_CondBroadcast
@@ -111,6 +109,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 #define MAX_SOUNDS		  2048 // johnfitz -- was 256
 #define MAX_PARTICLETYPES 2048
 
+#define SAVEGAME_LEVEL_LENGTH	22
 #define SAVEGAME_COMMENT_LENGTH 39
 
 #define MAX_STYLESTRING 64
@@ -350,13 +349,11 @@ static inline int FindLastBitNonZero64 (const uint64_t mask)
 #include "filenames.h"
 #include "common.h"
 
-// Our custom assert() output stack traces either on the console with Host_Error
+// Our customized assert_always() output stack traces either on the console with Host_Error
 // if we are on the main thread, else print on stdout and abort()
-// TBC : performance impact ? reserved for Debug builds ?
-#ifndef assert
-#define assert(e) ((e) ? (void)0 : COM_Assert_Failed (#e, __FILE__, __LINE__))
-#else
-#include <assert.h>
+// assert_always() is present in either Release or Debug builds.
+#ifndef assert_always
+#define assert_always(e) ((e) ? (void)0 : COM_Assert_Failed (#e, __FILE__, __LINE__))
 #endif
 
 #include "mem.h"
@@ -423,10 +420,12 @@ extern quakeparms_t *host_parms;
 extern cvar_t sys_ticrate;
 extern cvar_t sys_nostdout;
 extern cvar_t developer;
+extern cvar_t map_checks;
 extern cvar_t max_edicts; // johnfitz
 
 extern qboolean host_initialized; // true if into command execution
 extern double	host_frametime;
+extern double	host_rawframetime; // unscaled and unbounded
 extern byte	   *host_colormap;
 extern int		host_framecount; // incremented every frame, never reset
 extern double	realtime;		 // not bounded in any way, changed at
@@ -442,6 +441,46 @@ extern filelist_item_t *modlist;
 extern filelist_item_t *extralevels;
 extern filelist_item_t *demolist;
 extern filelist_item_t *savelist;
+
+typedef enum
+{
+	MAPTYPE_CUSTOM_MOD_START,
+	MAPTYPE_CUSTOM_MOD_LEVEL,
+	MAPTYPE_CUSTOM_MOD_END,
+	MAPTYPE_CUSTOM_MOD_DM,
+
+	MAPTYPE_MOD_START,
+	MAPTYPE_MOD_LEVEL,
+	MAPTYPE_MOD_END,
+	MAPTYPE_MOD_DM,
+
+	MAPTYPE_CUSTOM_ID_START,
+	MAPTYPE_CUSTOM_ID_LEVEL,
+	MAPTYPE_CUSTOM_ID_END,
+	MAPTYPE_CUSTOM_ID_DM,
+
+	MAPTYPE_ID_START,
+	MAPTYPE_ID_EP1_LEVEL,
+	MAPTYPE_ID_EP2_LEVEL,
+	MAPTYPE_ID_EP3_LEVEL,
+	MAPTYPE_ID_EP4_LEVEL,
+	MAPTYPE_ID_END,
+	MAPTYPE_ID_DM,
+	MAPTYPE_ID_LEVEL,
+
+	MAPTYPE_BMODEL,
+
+	MAPTYPE_COUNT,
+} maptype_t;
+
+maptype_t	ExtraMaps_GetType (const filelist_item_t *item);
+qboolean	ExtraMaps_IsStart (maptype_t type);
+const char *ExtraMaps_GetMessage (const filelist_item_t *item);
+
+extern filelist_item_t **extralevels_sorted;
+
+// friendly display name for a mod list entry (only valid for modlist items), NULL if unknown
+const char *Modlist_GetFullName (const filelist_item_t *item);
 
 void			   Host_ClearMemory (void);
 void			   Host_ServerFrame (void);
@@ -464,8 +503,12 @@ void DemoList_Init (void);
 void SaveList_Init (void);
 
 void ExtraMaps_NewGame (void);
+void ExtraMaps_Clear (void);
+void ExtraMaps_ShutDown (void);
 void DemoList_Rebuild (void);
 void SaveList_Rebuild (void);
+
+void M_CheckMods (void);
 
 extern int current_skill; // skill level for currently loaded level (in case
 						  //  the user changes the cvar while the level is
@@ -484,7 +527,5 @@ extern atomic_uint32_t num_vulkan_combined_image_samplers;
 extern atomic_uint32_t num_vulkan_ubos_dynamic;
 extern atomic_uint32_t num_vulkan_input_attachments;
 extern atomic_uint32_t num_vulkan_storage_images;
-
-extern qboolean multiuser;
 
 #endif /* QUAKEDEFS_H */

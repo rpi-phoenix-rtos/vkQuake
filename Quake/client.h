@@ -25,6 +25,8 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 // client.h
 
+#define CLIENT_USER_INFO_STRING_SIZE 8192
+
 typedef struct
 {
 	int	 length;
@@ -42,7 +44,7 @@ typedef struct
 	int	  ping;
 	byte  translations[VID_GRADES * 256];
 
-	char userinfo[8192];
+	char userinfo[CLIENT_USER_INFO_STRING_SIZE];
 } scoreboard_t;
 
 typedef struct
@@ -74,7 +76,10 @@ typedef struct
 	float  decay;	 // drop this each second
 	float  minlight; // don't add when contributing less
 	int	   key;
-	vec3_t color; // johnfitz -- lit support via lordhavoc
+	vec3_t color;		  // johnfitz -- lit support via lordhavoc
+	vec3_t cone_dir;	  // spotlight direction
+	float  cone_cos;	  // cos of the spotlight apex angle, <= -1: not a spotlight
+	float  kex_intensity; // > 0: rerelease dynamiclight entity, lit with the KEX falloff (linear over radius, Lambert, linear cone)
 } dlight_t;
 
 #define MAX_BEAMS 32 // johnfitz -- was 24
@@ -143,7 +148,7 @@ typedef struct
 	struct qsocket_s *netcon;
 	sizebuf_t		  message; // writing buffer to send to server
 
-	char userinfo[8192];
+	char userinfo[CLIENT_USER_INFO_STRING_SIZE];
 } client_static_t;
 
 extern client_static_t cls;
@@ -279,14 +284,15 @@ typedef struct
 	float zoom;
 	float zoomdir;
 
-	char serverinfo[8192]; // \key\value infostring data.
+	char serverinfo[SERVER_INFO_STRING_SIZE]; // \key\value infostring data.
 } client_state_t;
 
 //
 // cvars
 //
 extern cvar_t cl_name;
-extern cvar_t cl_color;
+
+extern cvar_t cl_topcolor, cl_bottomcolor;
 
 extern cvar_t cl_upspeed;
 extern cvar_t cl_forwardspeed;
@@ -358,6 +364,8 @@ void CL_Signon4 (void);
 void CL_Disconnect (void);
 void CL_Disconnect_f (void);
 void CL_NextDemo (void);
+
+void SV_UpdateInfo (int edict, const char *keyname, const char *value);
 
 //
 // cl_input

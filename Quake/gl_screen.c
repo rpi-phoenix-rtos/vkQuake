@@ -87,18 +87,19 @@ cvar_t scr_sbaralpha = {"scr_sbaralpha", "0.75", CVAR_ARCHIVE};
 cvar_t scr_conwidth = {"scr_conwidth", "0", CVAR_ARCHIVE};
 cvar_t scr_conscale = {"scr_conscale", "1", CVAR_ARCHIVE};
 cvar_t scr_crosshairscale = {"scr_crosshairscale", "1", CVAR_ARCHIVE};
+cvar_t scr_infoscale = {"scr_infoscale", "2.0", CVAR_ARCHIVE};
 cvar_t scr_showfps = {"scr_showfps", "0", CVAR_ARCHIVE};
 cvar_t scr_clock = {"scr_clock", "0", CVAR_NONE};
 cvar_t scr_autoclock = {"scr_autoclock", "1", CVAR_ARCHIVE};
 cvar_t scr_usekfont = {"scr_usekfont", "0", CVAR_NONE}; // 2021 re-release
-cvar_t scr_style = {"scr_style", "0", CVAR_ARCHIVE};
+cvar_t scr_style = {"scr_style", "0", CVAR_ARCHIVE_GAME};
 
-cvar_t scr_viewsize = {"viewsize", "100", CVAR_ARCHIVE};
-cvar_t scr_viewsize_allow_shrinking = {"viewsize_allow_shrinking", "0", CVAR_ARCHIVE};
-cvar_t scr_fov = {"fov", "90", CVAR_ARCHIVE}; // 10 - 170
-cvar_t scr_fov_adapt = {"fov_adapt", "1", CVAR_ARCHIVE};
-cvar_t scr_zoomfov = {"zoom_fov", "30", CVAR_ARCHIVE}; // 10 - 170
-cvar_t scr_zoomspeed = {"zoom_speed", "8", CVAR_ARCHIVE};
+cvar_t scr_viewsize = {"viewsize", "100", CVAR_ARCHIVE_GAME};
+cvar_t scr_viewsize_allow_shrinking = {"viewsize_allow_shrinking", "0", CVAR_ARCHIVE_GAME};
+cvar_t scr_fov = {"fov", "90", CVAR_ARCHIVE_GAME}; // 10 - 170
+cvar_t scr_fov_adapt = {"fov_adapt", "1", CVAR_ARCHIVE_GAME};
+cvar_t scr_zoomfov = {"zoom_fov", "30", CVAR_ARCHIVE_GAME}; // 10 - 170
+cvar_t scr_zoomspeed = {"zoom_speed", "8", CVAR_ARCHIVE_GAME};
 cvar_t scr_conspeed = {"scr_conspeed", "500", CVAR_ARCHIVE};
 cvar_t scr_conanim = {"scr_conanim", "0", CVAR_ARCHIVE};
 cvar_t scr_centertime = {"scr_centertime", "2", CVAR_NONE};
@@ -106,7 +107,7 @@ cvar_t scr_showturtle = {"showturtle", "0", CVAR_NONE};
 cvar_t scr_showpause = {"showpause", "1", CVAR_NONE};
 cvar_t scr_printspeed = {"scr_printspeed", "8", CVAR_NONE};
 
-cvar_t cl_gun_fovscale = {"cl_gun_fovscale", "1", CVAR_ARCHIVE}; // Qrack
+cvar_t cl_gun_fovscale = {"cl_gun_fovscale", "1", CVAR_ARCHIVE_GAME}; // Qrack
 
 // All scaling is done relative to resolution with scr_relativescale
 cvar_t scr_relativescale = {"scr_relativescale", "2", CVAR_ARCHIVE};
@@ -115,11 +116,17 @@ cvar_t scr_relsbarscale = {"scr_relsbarscale", "1", CVAR_ARCHIVE};
 cvar_t scr_relcrosshairscale = {"scr_relcrosshairscale", "1", CVAR_ARCHIVE};
 cvar_t scr_relconscale = {"scr_relconscale", "1", CVAR_ARCHIVE};
 
-extern cvar_t crosshair;
-extern cvar_t crosshair_def;
-extern cvar_t r_tasks;
-extern cvar_t r_gpulightmapupdate;
-extern cvar_t r_showbboxes;
+extern cvar_t	 crosshair;
+extern cvar_t	 crosshair_def;
+extern cvar_t	 crosshair_size;
+extern cvar_t	 r_tasks;
+extern cvar_t	 r_gpulightmapupdate;
+extern cvar_t	 r_showbboxes;
+extern cvar_t	 r_showfields;
+extern cvar_t	 r_showfields_align;
+extern edict_t **bbox_linked;
+extern float	 r_fovx;
+extern float	 r_fovy;
 
 qboolean scr_initialized; // ready to draw
 
@@ -130,9 +137,10 @@ int clearconsole;
 
 vrect_t scr_vrect;
 
-qboolean scr_disabled_for_loading;
-qboolean scr_drawloading;
-float	 scr_disabled_time;
+qboolean		scr_disabled_for_loading;
+qboolean		scr_drawloading;
+static qboolean scr_drawstartuploading = true;
+float			scr_disabled_time;
 
 qboolean	   in_update_screen;
 extern jmp_buf screen_error;
@@ -172,7 +180,8 @@ for a few moments
 */
 void SCR_CenterPrint (const char *str) // update centerprint data
 {
-	strncpy (scr_centerstring, str, sizeof (scr_centerstring) - 1);
+	//	strncpy (scr_centerstring, str, sizeof (scr_centerstring) - 1);
+	COM_WordWrap (scr_centerstring, str, sizeof (scr_centerstring), scr_usekfont.value ? 40 : 0);
 	scr_centertime_off = cl.time + scr_centertime.value;
 	scr_centertime_start = cl.time;
 
@@ -546,6 +555,7 @@ void SCR_Init (void)
 	Cvar_RegisterVariable (&scr_conwidth);
 	Cvar_RegisterVariable (&scr_conscale);
 	Cvar_RegisterVariable (&scr_crosshairscale);
+	Cvar_RegisterVariable (&scr_infoscale);
 	Cvar_RegisterVariable (&scr_showfps);
 	Cvar_RegisterVariable (&scr_clock);
 	Cvar_RegisterVariable (&scr_autoclock);
@@ -583,7 +593,7 @@ void SCR_Init (void)
 	Cvar_SetCallback (&scr_relconscale, &SCR_UpdateRelativeScale_f);
 	SCR_UpdateRelativeScale ();
 
-	if (CFG_OpenConfig ("config.cfg") == 0)
+	if (CFG_OpenConfig (CONFIG_NAME) == 0)
 	{
 		const char *early_read[] = {"scr_relativescale"};
 		CFG_ReadCvars (early_read, 1);
@@ -651,6 +661,25 @@ static void SCR_DrawFPS (cb_context_t *cbx)
 
 /*
 ==============
+SCR_DrawSpeeds -- scr_speeds overlay in the top right corner
+==============
+*/
+static void SCR_DrawSpeeds (cb_context_t *cbx)
+{
+	if (!scr_speeds.value || (rs_display_numlines == 0) || (scr_viewsize.value >= 130))
+		return;
+
+	GL_SetCanvas (cbx, CANVAS_TOPRIGHT);
+	int y = 0;
+	for (int i = 0; i < rs_display_numlines; i++)
+	{
+		Draw_String (cbx, 320 - ((int)strlen (rs_display_lines[i]) << 3), y, rs_display_lines[i]);
+		y += CHARACTER_SIZE;
+	}
+}
+
+/*
+==============
 SCR_DrawClock -- johnfitz
 ==============
 */
@@ -673,7 +702,7 @@ static void SCR_DrawClock (cb_context_t *cbx)
 		shown_pause = true;
 	}
 
-	if ((scr_clock.value == 0 && scr_clock_off <= 0 && !(sb_showscores && !fitzmode && scr_autoclock.value)) || scr_viewsize.value >= 130)
+	if ((scr_clock.value == 0 && scr_clock_off <= 0 && !(sb_showscores && scr_autoclock.value)) || scr_viewsize.value >= 130)
 		return;
 
 	scr_clock_off -= host_frametime / (cls.demospeed ? cls.demospeed : 1.f);
@@ -707,11 +736,222 @@ static void SCR_DrawClock (cb_context_t *cbx)
 	}
 }
 
+typedef struct scr_info_line_s
+{
+	char key[64];
+	char value[256];
+} scr_info_line_t;
+
+static qboolean SCR_ProjectWorldToScreen (const vec3_t point, float *x, float *y)
+{
+	vec3_t delta;
+	float  z, px, py;
+
+	VectorSubtract (point, r_origin, delta);
+	z = DotProduct (delta, vpn);
+	if (z <= 1.0f)
+		return false;
+
+	px = DotProduct (delta, vright) / (z * tanf (DEG2RAD (r_fovx) * 0.5f));
+	py = DotProduct (delta, vup) / (z * tanf (DEG2RAD (r_fovy) * 0.5f));
+
+	*x = r_refdef.vrect.x + (0.5f + 0.5f * px) * r_refdef.vrect.width;
+	*y = r_refdef.vrect.y + (0.5f - 0.5f * py) * r_refdef.vrect.height;
+	*x = CLAMP (0.0f, *x, (float)glwidth);
+	*y = CLAMP (0.0f, *y, (float)glheight);
+	return true;
+}
+
+static void SCR_GetEdictCenter (const edict_t *ed, vec3_t center)
+{
+	VectorCopy (ed->v.origin, center);
+	if (!VectorCompare (ed->v.mins, ed->v.maxs))
+	{
+		VectorMA (center, 0.5f, ed->v.mins, center);
+		VectorMA (center, 0.5f, ed->v.maxs, center);
+	}
+}
+
+static void SCR_GetEdictBottom (const edict_t *ed, vec3_t bottom)
+{
+	SCR_GetEdictCenter (ed, bottom);
+	if (!VectorCompare (ed->v.mins, ed->v.maxs))
+		bottom[2] = ed->v.origin[2] + ed->v.mins[2];
+}
+
+static void SCR_SetInfoColor (vec3_t color, float r, float g, float b)
+{
+	color[0] = r;
+	color[1] = g;
+	color[2] = b;
+}
+
+static void SCR_InfoLine (scr_info_line_t *lines, int *numlines, const char *key, const char *value)
+{
+	if (*numlines >= 96)
+		return;
+
+	q_strlcpy (lines[*numlines].key, key ? key : "", sizeof (lines[*numlines].key));
+	q_strlcpy (lines[*numlines].value, value ? value : "", sizeof (lines[*numlines].value));
+	(*numlines)++;
+}
+
+static void SCR_InfoFieldLines (scr_info_line_t *lines, int *numlines, const char *key, const char *value)
+{
+	const char *start = value;
+	char		line[256];
+
+	if (!start || !*start)
+	{
+		SCR_InfoLine (lines, numlines, key, "");
+		return;
+	}
+
+	while (*start)
+	{
+		const char *end = strchr (start, '\n');
+		size_t		len = end ? (size_t)(end - start) : strlen (start);
+		len = q_min (len, sizeof (line) - 1);
+		memcpy (line, start, len);
+		line[len] = 0;
+		SCR_InfoLine (lines, numlines, key, line);
+		key = "";
+		if (!end)
+			break;
+		start = end + 1;
+	}
+}
+
+static void SCR_DrawInfoPanel (cb_context_t *cbx, float x, float y, const scr_info_line_t *lines, int numlines, const vec3_t bgcolor)
+{
+	float scale, charw, charh, keyw, valuew, width, height;
+
+	if (numlines <= 0)
+		return;
+
+	scale = CLAMP (1.0f, scr_infoscale.value, 8.0f);
+	charw = CHARACTER_SIZE * scale;
+	charh = CHARACTER_SIZE * scale;
+	keyw = valuew = 0.0f;
+
+	for (int i = 0; i < numlines; i++)
+	{
+		keyw = q_max (keyw, strlen (lines[i].key) * charw);
+		valuew = q_max (valuew, strlen (lines[i].value) * charw);
+	}
+
+	width = keyw + valuew + 3.0f * charw;
+	height = (numlines + 1) * charh;
+	x = CLAMP (0.0f, x, q_max (0.0f, glwidth - width));
+	y = CLAMP (0.0f, y, q_max (0.0f, glheight - height));
+
+	GL_SetCanvas (cbx, CANVAS_DEFAULT);
+	Draw_Fill (cbx, x, y, width, height, 0, 0.65f);
+
+	for (int i = 0; i < numlines; i++)
+	{
+		const float liney = y + (i + 0.5f) * charh;
+		GL_SetCanvasColor (0.85f + bgcolor[0] * 0.5f, 0.75f + bgcolor[1] * 0.5f, 0.45f + bgcolor[2] * 0.5f, 1.0f);
+		Draw_String_Scaled (cbx, x + 0.5f * charw, liney, lines[i].key, scale);
+		GL_SetCanvasColor (1.0f, 1.0f, 1.0f, 1.0f);
+		Draw_String_Scaled (cbx, x + keyw + 1.5f * charw, liney, lines[i].value, scale);
+	}
+}
+
+static void SCR_DrawEdictInfo (cb_context_t *cbx)
+{
+	scr_info_line_t lines[96];
+	vec3_t			anchor, bgcolor;
+	float			x, y;
+	int				numlines;
+
+	if (VEC_SIZE (bbox_linked) == 0 && VEC_SIZE (r_pointfile) == 0)
+		return;
+
+	if (VEC_SIZE (r_pointfile) != 0 && SCR_ProjectWorldToScreen (r_pointfile[0], &x, &y))
+	{
+		numlines = 0;
+		SCR_InfoLine (lines, &numlines, "", "Leak");
+		SCR_SetInfoColor (bgcolor, 0.25f, 0.0f, 0.0f);
+		SCR_DrawInfoPanel (cbx, x, y, lines, numlines, bgcolor);
+	}
+
+	if (VEC_SIZE (bbox_linked) == 0)
+		return;
+
+	PR_SwitchQCVM (&sv.qcvm);
+
+	for (int i = (int)VEC_SIZE (bbox_linked) - 1; i >= 0; i--)
+	{
+		edict_t *ed = bbox_linked[i];
+
+		if (i == 0 && r_showfields.value && !r_showfields_align.value)
+			continue;
+
+		SCR_GetEdictCenter (ed, anchor);
+		if (!SCR_ProjectWorldToScreen (anchor, &x, &y))
+			continue;
+
+		numlines = 0;
+		SCR_InfoLine (lines, &numlines, "", va ("edict %d", NUM_FOR_EDICT (ed)));
+		if (ed->v.classname)
+			SCR_InfoLine (lines, &numlines, "", PR_GetString (ed->v.classname));
+
+		switch (ed->showbboxflags)
+		{
+		default:
+		case SHOWBBOX_LINK_NONE:
+			SCR_SetInfoColor (bgcolor, 0.0f, 0.0f, 0.0f);
+			break;
+		case SHOWBBOX_LINK_INCOMING:
+			SCR_SetInfoColor (bgcolor, 0.25f, 0.125f, 0.125f);
+			break;
+		case SHOWBBOX_LINK_OUTGOING:
+			SCR_SetInfoColor (bgcolor, 0.125f, 0.125f, 0.25f);
+			break;
+		case SHOWBBOX_LINK_BOTH:
+			SCR_SetInfoColor (bgcolor, 0.25f, 0.125f, 0.25f);
+			break;
+		}
+
+		SCR_DrawInfoPanel (cbx, x, y, lines, numlines, bgcolor);
+	}
+
+	if (r_showfields.value)
+	{
+		edict_t *ed = bbox_linked[0];
+
+		SCR_GetEdictBottom (ed, anchor);
+		if (!SCR_ProjectWorldToScreen (anchor, &x, &y) || r_showfields_align.value)
+		{
+			x = glwidth;
+			y = glheight;
+		}
+
+		numlines = 0;
+		SCR_InfoLine (lines, &numlines, "Edict", va ("%d", NUM_FOR_EDICT (ed)));
+		SCR_InfoLine (lines, &numlines, "classname", ed->v.classname ? PR_GetString (ed->v.classname) : "");
+
+		for (int i = 1; i < qcvm->progs->numfielddefs; i++)
+		{
+			ddef_t *d = &qcvm->fielddefs[i];
+			if (d->ofs * 4 == offsetof (entvars_t, classname) || !ED_IsRelevantField (ed, d))
+				continue;
+			SCR_InfoFieldLines (lines, &numlines, PR_GetString (d->s_name), ED_FieldValueString (ed, d));
+		}
+
+		SCR_SetInfoColor (bgcolor, 0.0f, 0.0f, 0.0f);
+		SCR_DrawInfoPanel (cbx, x, y, lines, numlines, bgcolor);
+	}
+
+	PR_SwitchQCVM (NULL);
+}
+
 /*
 ==============
 SCR_DrawDevStats
 ==============
-*/
+ */
 static void SCR_DrawDevStats (cb_context_t *cbx)
 {
 	char str[40];
@@ -822,21 +1062,61 @@ static void SCR_DrawPause (cb_context_t *cbx)
 }
 
 /*
-==============
-SCR_DrawLoading
-==============
+=============
+SCR_DrawLoadingPic
+=============
 */
-static void SCR_DrawLoading (cb_context_t *cbx)
+static void SCR_DrawLoadingPic (cb_context_t *cbx)
 {
 	qpic_t *pic;
-
-	if (!scr_drawloading)
-		return;
 
 	GL_SetCanvas (cbx, CANVAS_MENU); // johnfitz
 
 	pic = Draw_CachePic ("gfx/loading.lmp");
 	Draw_Pic (cbx, (320 - pic->width) / 2, (240 - 48 - pic->height) / 2, pic, 1.0f, false); // johnfitz -- stretched menus
+}
+
+/*
+=============
+SCR_DrawStartupSplashPic
+=============
+*/
+static void SCR_DrawStartupSplashPic (cb_context_t *cbx)
+{
+	const float startup_logo_scale = 1.5f;
+	qpic_t	   *pic;
+	float		logo_size, source_size, logo_t;
+
+	GL_SetCanvas (cbx, CANVAS_MENU); // johnfitz
+
+	pic = Draw_CachePic ("gfx/qplaque.lmp");
+	source_size = pic->width;
+	logo_size = source_size * startup_logo_scale;
+	logo_t = (pic->height - source_size) / pic->height;
+	Draw_SubPic (cbx, (320 - logo_size) / 2, (240 - 48 - logo_size) / 2, logo_size, logo_size, pic, 0, logo_t, 1, source_size / pic->height, NULL, 1.0f);
+}
+
+/*
+=============
+SCR_DrawMenuLoading
+=============
+*/
+static void SCR_DrawMenuLoading (cb_context_t *cbx, qboolean startup)
+{
+	const float	   old_con_current = scr_con_current;
+	const qboolean old_con_forcedup = con_forcedup;
+
+	scr_con_current = glheight;
+	con_forcedup = true;
+	Draw_ConsoleBackground (cbx);
+	con_forcedup = old_con_forcedup;
+	scr_con_current = old_con_current;
+
+	// the startup splash is id1 artwork, mods get the "Loading" pic instead
+	if (startup && COM_GetGameNames (false)[0] == 0)
+		SCR_DrawStartupSplashPic (cbx);
+	else
+		SCR_DrawLoadingPic (cbx);
 }
 
 /*
@@ -852,10 +1132,7 @@ static void SCR_DrawCrosshair (cb_context_t *cbx)
 	GL_SetCanvas (cbx, CANVAS_CROSSHAIR);
 
 	if (crosshair.value)
-	{
-		crosshair_t current = M_GetCrosshairDef (crosshair_def.value);
-		Draw_Character (cbx, current.viewport_x_offset, current.viewport_y_offset, current.crosshair_char); // 0,0 is center of viewport
-	}
+		M_DrawCrosshair (cbx, 0.0f, 0.0f, CLAMP (6.0f, crosshair_size.value, 64.0f));
 }
 
 //=============================================================================
@@ -874,7 +1151,7 @@ static void SCR_SetUpToDrawConsole (void)
 
 	Con_CheckResize ();
 
-	if (scr_drawloading)
+	if (scr_drawloading || (scr_drawstartuploading && cls.state == ca_disconnected))
 		return; // never a console with loading plaque
 
 	if (con_forcedup)
@@ -946,22 +1223,35 @@ void SCR_BeginLoadingPlaque (void)
 {
 	S_StopAllSounds (true, false);
 
-	if (cls.state != ca_connected)
-		return;
-	if (cls.signon != SIGNONS)
+	if (cls.state == ca_dedicated)
 		return;
 
-	// redraw with no console and the loading plaque
+	// Draw a clean loading frame and freeze screen updates until loading finishes.
 	Con_ClearNotify ();
 	SCR_CenterPrintClear ();
-	scr_con_current = 0;
+
+	// map/connect/load stop the demo loop before getting here, so this only stays set for the initial attract loads
+	if (cls.demonum == -1)
+		scr_drawstartuploading = false;
 
 	scr_drawloading = true;
 	SCR_UpdateScreen (false);
 	scr_drawloading = false;
+	scr_con_current = 0;
 
 	scr_disabled_for_loading = true;
 	scr_disabled_time = realtime;
+}
+
+/*
+===============
+SCR_EndStartupLoadingPlaque
+
+================
+*/
+void SCR_EndStartupLoadingPlaque (void)
+{
+	scr_drawstartuploading = false;
 }
 
 /*
@@ -1112,13 +1402,11 @@ static void SCR_DrawGUI (void *unused)
 	SCR_TileClear (cbx);
 
 	const qboolean cscqhud = (scr_style.value < 1.0f) && cl.qcvm.extfuncs.CSQC_DrawHud;
-	qboolean	   use_mutex = r_showbboxes.value && cscqhud;
-
-	if (use_mutex)
-		SDL_LockMutex (draw_qcvm_mutex);
 
 	if (cscqhud && setjmp (screen_error))
 		PR_ClearProgs (&cl.qcvm);
+
+	SDL_LockMutex (draw_qcvm_mutex);
 
 	if (scr_drawdialog) // new game confirm
 	{
@@ -1129,10 +1417,9 @@ static void SCR_DrawGUI (void *unused)
 		Draw_FadeScreen (cbx);
 		SCR_DrawNotifyString (cbx);
 	}
-	else if (scr_drawloading) // loading
+	else if (scr_drawloading || (scr_drawstartuploading && cls.state == ca_disconnected)) // loading
 	{
-		SCR_DrawLoading (cbx);
-		Sbar_Draw (cbx);
+		SCR_DrawMenuLoading (cbx, scr_drawstartuploading);
 	}
 	else if (cl.intermission == 1 && key_dest == key_game) // end of level
 	{
@@ -1153,14 +1440,14 @@ static void SCR_DrawGUI (void *unused)
 		Sbar_Draw (cbx);
 		SCR_DrawDevStats (cbx); // johnfitz
 		SCR_DrawFPS (cbx);		// johnfitz
-		SCR_DrawClock (cbx);	// johnfitz
+		SCR_DrawSpeeds (cbx);
+		SCR_DrawClock (cbx); // johnfitz
+		SCR_DrawEdictInfo (cbx);
 		SCR_DrawConsole (cbx);
 		M_Draw (cbx);
 	}
 
-	if (use_mutex)
-		SDL_UnlockMutex (draw_qcvm_mutex);
-
+	SDL_UnlockMutex (draw_qcvm_mutex);
 	R_EndDebugUtilsLabel (cbx);
 }
 
@@ -1182,6 +1469,11 @@ SCR_DrawDone
 */
 static void SCR_DrawDone (void *unused)
 {
+	if (scr_speeds.value)
+		rs_cputime_us = (uint32_t)((Sys_DoubleTime () - rs_frame_starttime) * 1000000.0);
+	// end_rendering depends on draw_done, so this can't lose a wait from the current frame
+	rs_gpuwaittime_us = rs_gpuwaitaccum_us;
+	rs_gpuwaitaccum_us = 0;
 	r_framecount++;
 }
 
@@ -1265,8 +1557,8 @@ void SCR_UpdateScreen (qboolean use_tasks)
 
 		task_handle_t draw_done_task = Task_AllocateAndAssignFunc (SCR_DrawDone, NULL, 0);
 		task_handle_t setup_frame_task = Task_AllocateAndAssignFunc (SCR_SetupFrame, NULL, 0);
-		V_RenderView (use_tasks, begin_rendering_task, setup_frame_task, draw_done_task);
 		task_handle_t draw_gui_task = Task_AllocateAndAssignFunc (SCR_DrawGUI, NULL, 0);
+		V_RenderView (use_tasks, begin_rendering_task, setup_frame_task, draw_done_task, draw_gui_task);
 		task_handle_t end_rendering_task = GL_EndRendering (use_tasks, true);
 
 		Task_AddDependency (begin_rendering_task, draw_gui_task);
@@ -1285,7 +1577,7 @@ void SCR_UpdateScreen (qboolean use_tasks)
 	{
 		GL_SynchronizeEndRenderingTask ();
 		SCR_SetupFrame (NULL);
-		V_RenderView (use_tasks, INVALID_TASK_HANDLE, INVALID_TASK_HANDLE, INVALID_TASK_HANDLE);
+		V_RenderView (use_tasks, INVALID_TASK_HANDLE, INVALID_TASK_HANDLE, INVALID_TASK_HANDLE, INVALID_TASK_HANDLE);
 		S_ExtraUpdate ();
 		SCR_DrawGUI (NULL);
 		SCR_DrawDone (NULL);

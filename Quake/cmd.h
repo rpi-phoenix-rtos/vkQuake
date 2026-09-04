@@ -87,30 +87,39 @@ typedef enum
 extern cmd_source_t cmd_source;
 
 typedef void (*xcommand_t) (void);
+typedef void (*xtabcommand_t) (const char *partial);
+
 typedef struct cmd_function_s
 {
 	struct cmd_function_s *next;
 	const char			  *name;
 	xcommand_t			   function;
+	xtabcommand_t		   completion;
 	cmd_source_t		   srctype;
 	qboolean			   dynamic;
+	qboolean			   qcinterceptable;
 } cmd_function_t;
 
 void Cmd_Init (void);
 
-cmd_function_t *Cmd_AddCommand2 (const char *cmd_name, xcommand_t function, cmd_source_t srctype);
+cmd_function_t *Cmd_AddCommand2 (const char *cmd_name, xcommand_t function, cmd_source_t srctype, qboolean qcinterceptable);
 void			Cmd_RemoveCommand (cmd_function_t *cmd);
 // called by the init functions of other parts of the program to
 // register commands and functions to call for them.
 // The cmd_name is referenced later, so it should not be in temp memory
-#define Cmd_AddCommand(cmdname, func)				Cmd_AddCommand2 (cmdname, func, src_command) // regular console commands
-#define Cmd_AddCommand_ClientCommand(cmdname, func) Cmd_AddCommand2 (cmdname, func, src_client)	 // command is meant to be safe for anyone to execute.
-#define Cmd_AddCommand_ServerCommand(cmdname, func) Cmd_AddCommand2 (cmdname, func, src_server)	 // command came from a server
-#define Cmd_AddCommand_Console						Cmd_AddCommand								 // to make the disabiguation more obvious
+#define Cmd_AddCommand(cmdname, func)				Cmd_AddCommand2 (cmdname, func, src_command, false) // regular console commands
+#define Cmd_AddCommand_ClientCommand(cmdname, func) Cmd_AddCommand2 (cmdname, func, src_client, false)	// command is meant to be safe for anyone to execute.
+#define Cmd_AddCommand_ServerCommand(cmdname, func) Cmd_AddCommand2 (cmdname, func, src_server, false)	// command came from a server
+#define Cmd_AddCommand_Console						Cmd_AddCommand										// to make the disabiguation more obvious
 
 qboolean Cmd_AliasExists (const char *aliasname);
 qboolean Cmd_Exists (const char *cmd_name);
 // used by the cvar code to check for cvar / command name overlap
+
+cmd_function_t *Cmd_FindCommand (const char *cmd_name);
+
+qboolean Cmd_IsReservedName (const char *name);
+// returns true if name starts with 2 underscores
 
 const char *Cmd_CompleteCommand (const char *partial);
 // attempts to match a partial command for automatic command line completion
@@ -130,6 +139,9 @@ int Cmd_CheckParm (const char *parm);
 void Cmd_TokenizeString (const char *text);
 // Takes a null terminated string.  Does not need to be /n terminated.
 // breaks the string up into arg tokens.
+
+void Cmd_AddArg (const char *arg);
+// appends a token to the current argument list
 
 qboolean Cmd_ExecuteString (const char *text, cmd_source_t src);
 // Parses a single line of text into arguments and tries to execute it.

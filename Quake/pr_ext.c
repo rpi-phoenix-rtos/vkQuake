@@ -51,6 +51,11 @@ extern cvar_t sv_gameplayfix_setmodelrealbox, r_fteparticles;
 cvar_t pr_checkextension = {"pr_checkextension", "1", CVAR_NONE}; // spike - enables qc extensions. if 0 then they're ALL BLOCKED! MWAHAHAHA! *cough* *splutter*
 static int pr_ext_warned_particleeffectnum;						  // so these only spam once per map
 
+extern qpic_t *pic_nul;
+
+// draw_qcvm_mutex also protects q_cachepics  / scrap updates
+extern SDL_Mutex *draw_qcvm_mutex;
+
 static void *PR_FindExtGlobal (int type, const char *name);
 void		 SV_CheckVelocity (edict_t *ent);
 
@@ -68,8 +73,6 @@ typedef enum multicast_e
 	MULTICAST_INIT
 } multicast_t;
 static void SV_Multicast (multicast_t to, float *org, int msg_entity, unsigned int requireext2);
-
-#define RETURN_EDICT(e) (((int *)qcvm->globals)[OFS_RETURN] = EDICT_TO_PROG (e))
 
 int PR_MakeTempString (const char *val)
 {
@@ -244,6 +247,11 @@ int PR_Markup_Parse (struct markup_s *mu)
 #define D(typestr, desc) typestr, desc
 
 // #define fixme
+
+static void PF_NotImplemented (void)
+{
+	// placeholder for intentionally not-implemented functions.
+}
 
 // maths stuff
 static void PF_Sin (void)
@@ -1436,36 +1444,36 @@ static void PF_sprintf_internal (const char *s, int firstarg, char *outbuf, int 
 							q_snprintf (o, end - o, formatbuf, width, precision, quotedarg);
 						o += strlen (o);
 					}
-/*								else
-								{
-									if(precision < 0) // not set
-										precision = end - o - 1;
-									o += u8_strpad(o, end - o, quotedarg, (flags & PRINTF_LEFT) != 0, width, precision);
-								}
-*/							}
-break;
-case 's':
-	// UTF-8-FIXME: figure it out yourself
-	//							if(flags & PRINTF_ALTERNATE)
-	{
-		if (precision < 0) // not set
-			q_snprintf (o, end - o, formatbuf, width, GETARG_STRING (thisarg));
-		else
-			q_snprintf (o, end - o, formatbuf, width, precision, GETARG_STRING (thisarg));
-		o += strlen (o);
-	}
-	/*							else
-								{
-									if(precision < 0) // not set
-										precision = end - o - 1;
-									o += u8_strpad(o, end - o, GETARG_STRING(thisarg), (flags & PRINTF_LEFT) != 0, width, precision);
-								}
-	*/
-	break;
-default:
-	Con_Warning ("PF_sprintf: invalid format string: %s\n", s0);
-	goto finished;
-}
+				/*								else
+												{
+													if(precision < 0) // not set
+														precision = end - o - 1;
+													o += u8_strpad(o, end - o, quotedarg, (flags & PRINTF_LEFT) != 0, width, precision);
+												}
+				*/							}
+				break;
+				case 's':
+					// UTF-8-FIXME: figure it out yourself
+					//							if(flags & PRINTF_ALTERNATE)
+					{
+						if (precision < 0) // not set
+							q_snprintf (o, end - o, formatbuf, width, GETARG_STRING (thisarg));
+						else
+							q_snprintf (o, end - o, formatbuf, width, precision, GETARG_STRING (thisarg));
+						o += strlen (o);
+					}
+					/*							else
+												{
+													if(precision < 0) // not set
+														precision = end - o - 1;
+													o += u8_strpad(o, end - o, GETARG_STRING(thisarg), (flags & PRINTF_LEFT) != 0, width, precision);
+												}
+					*/
+					break;
+				default:
+					Con_Warning ("PF_sprintf: invalid format string: %s\n", s0);
+					goto finished;
+				}
 			}
 			++s;
 			break;
@@ -2496,7 +2504,7 @@ static void PF_cvar_type (void)
 	if (v)
 	{
 		ret |= 1; // CVAR_EXISTS
-		if (v->flags & CVAR_ARCHIVE)
+		if (v->flags & (CVAR_ARCHIVE | CVAR_ARCHIVE_GAME))
 			ret |= 2; // CVAR_TYPE_SAVED
 					  //		if(v->flags & CVAR_NOTFROMSERVER)
 					  //			ret |= 4; // CVAR_TYPE_PRIVATE
@@ -3000,6 +3008,243 @@ static void PF_cl_localsound (void)
 }
 // file stuff
 
+// returns false if the file is denied.
+// fallbackread can be NULL, if the qc is not allowed to read that (original) file at all.
+static qboolean QC_FixFileName (const char *name, const char **result, const char **fallbackread)
+{
+	if (!*name ||			   // blank names are bad
+		strchr (name, ':') ||  // dos/win absolute path, ntfs ADS, amiga drives. reject them all.
+		strchr (name, '\\') || // windows-only paths.
+		*name == '/' ||		   // absolute path was given - reject
+		strstr (name, ".."))   // someone tried to be clever.
+	{
+		return false;
+	}
+
+	*fallbackread = name;
+	// if its a user config, ban any fallback locations so that csqc can't read passwords or whatever.
+	if ((!strchr (name, '/') || q_strncasecmp (name, "configs/", 8)) && !q_strcasecmp (COM_FileGetExtension (name), "cfg") &&
+		q_strncasecmp (name, "particles/", 10) && q_strncasecmp (name, "huds/", 5) && q_strncasecmp (name, "models/", 7))
+		*fallbackread = NULL;
+	*result = va ("data/%s", name);
+	return true;
+}
+
+// small note on access modes:
+// when reading, we fopen files inside paks, for compat with (crappy non-zip-compatible) filesystem code
+// when writing, we directly fopen the file such that it can never be inside a pak.
+// this means that we need to take care when reading in order to detect EOF properly.
+// writing doesn't need anything like that, so it can just dump stuff out, but we do need to ensure that the modes don't get mixed up, because trying to read
+// from a writable file will not do what you would expect. even libc mandates a seek between reading+writing, so no great loss there.
+static struct qcfile_s
+{
+	qcvm_t	   *owningvm;
+	char		cache[4 * 4096];
+	qfileofs_t	cacheoffset;
+	qfilesize_t cachesize;
+	FILE	   *file;
+	qfileofs_t	fileoffset;
+	qfilesize_t filesize;
+	qfileofs_t	filebase; // the offset of the file inside a pak
+	int			mode;
+} *qcfiles;
+
+static size_t qcfiles_max;
+
+#define QC_FILE_BASE 1
+
+static void PF_fopen (void)
+{
+	const char *fname = G_STRING (OFS_PARM0);
+	int			fmode = G_FLOAT (OFS_PARM1);
+	const char *fallback;
+	FILE	   *file;
+	size_t		i;
+	char		name[MAX_OSPATH];
+	qfilesize_t filesize = 0;
+
+	G_FLOAT (OFS_RETURN) = -1; // assume failure
+
+	if (!QC_FixFileName (fname, &fname, &fallback))
+	{
+		Con_Printf ("PF_fopen: Access denied: %s\n", fname);
+		return;
+	}
+	// if we were told to use 'foo.txt'
+	// fname is now 'data/foo.txt'
+	// fallback is now 'foo.txt', and must ONLY be read.
+
+	switch (fmode)
+	{
+	case 0: // read
+		filesize = COM_FOpenFile (fname, &file, NULL);
+		if (!file && fallback)
+			filesize = COM_FOpenFile (fallback, &file, NULL);
+		break;
+	case 1: // append
+		q_snprintf (name, sizeof (name), "%s/%s", com_gamedir, fname);
+		file = Sys_fopen (name, "w+b");
+		if (file)
+			Sys_fseek (file, 0, SEEK_END);
+		break;
+	case 2: // write
+		q_snprintf (name, sizeof (name), "%s/%s", com_gamedir, fname);
+		file = Sys_fopen (name, "wb");
+		break;
+	default:
+		Con_Warning ("PF_fopen: unsupported mode: %i\n", fmode);
+		return;
+	}
+	if (!file)
+		return;
+
+	for (i = 0;; i++)
+	{
+		if (i == qcfiles_max)
+		{
+			qcfiles_max++;
+			qcfiles = Mem_Realloc (qcfiles, sizeof (*qcfiles) * qcfiles_max);
+		}
+		if (!qcfiles[i].file)
+			break;
+	}
+	qcfiles[i].filebase = Sys_ftell (file);
+	qcfiles[i].owningvm = qcvm;
+	qcfiles[i].file = file;
+	qcfiles[i].mode = fmode;
+	// reading needs size info
+	qcfiles[i].filesize = filesize;
+	// clear the read cache.
+	qcfiles[i].fileoffset = qcfiles[i].cacheoffset = qcfiles[i].cachesize = 0;
+
+	G_FLOAT (OFS_RETURN) = i + QC_FILE_BASE;
+}
+
+static void PF_fgets (void)
+{
+	size_t fileid = G_FLOAT (OFS_PARM0) - QC_FILE_BASE;
+	G_INT (OFS_RETURN) = 0;
+	if (fileid >= qcfiles_max)
+		Con_Warning ("PF_fgets: invalid file handle\n");
+	else if (!qcfiles[fileid].file)
+		Con_Warning ("PF_fgets: file not open\n");
+	else if (qcfiles[fileid].mode != 0)
+		Con_Warning ("PF_fgets: file not open for reading\n");
+	else
+	{
+		struct qcfile_s *f = &qcfiles[fileid];
+		char			*ret = PR_GetTempString ();
+		char			*s = ret;
+		char			*end = ret + STRINGTEMP_LENGTH;
+		for (;;)
+		{
+			if (f->cacheoffset == f->cachesize)
+			{
+				// figure out how much we can try to cache.
+				qfilesize_t sz = f->filesize - f->fileoffset;
+				if (sz < 0 || f->fileoffset < 0) //... maybe we shouldn't have implemented seek support.
+					sz = 0;
+				else if (sz > sizeof (f->cache))
+					sz = sizeof (f->cache);
+				// read a chunk
+				f->cacheoffset = 0;
+				f->cachesize = fread (f->cache, 1, sz, f->file);
+				f->fileoffset += f->cachesize;
+				if (!f->cachesize)
+				{
+					if (s == ret)
+					{ // absolutely nothing to spew
+						G_INT (OFS_RETURN) = 0;
+						return;
+					}
+					// classic eof...
+					break;
+				}
+			}
+			*s = f->cache[f->cacheoffset++];
+			if (*s == '\n') // new line, yay!
+				break;
+			s++;
+			if (s == end)
+				s--; // rewind if we're overflowing, such that we truncate the string.
+		}
+		if (s > ret && s[-1] == '\r')
+			s--; // terminate it on the \r of a \r\n pair.
+		*s = 0;	 // terminate it
+		G_INT (OFS_RETURN) = PR_SetEngineString (ret);
+	}
+}
+
+static void PF_fputs (void)
+{
+	size_t		fileid = G_FLOAT (OFS_PARM0) - QC_FILE_BASE;
+	const char *str = PF_VarString (1);
+	if (fileid >= qcfiles_max)
+		Con_Warning ("PF_fputs: invalid file handle\n");
+	else if (!qcfiles[fileid].file)
+		Con_Warning ("PF_fputs: file not open\n");
+	else if (qcfiles[fileid].mode == 0)
+		Con_Warning ("PF_fgets: file not open for writing\n");
+	else
+		fputs (str, qcfiles[fileid].file);
+}
+
+static void PF_fclose (void)
+{
+	size_t fileid = G_FLOAT (OFS_PARM0) - QC_FILE_BASE;
+	if (fileid >= qcfiles_max)
+		Con_Warning ("PF_fclose: invalid file handle\n");
+	else if (!qcfiles[fileid].file)
+		Con_Warning ("PF_fclose: file not open\n");
+	else
+	{
+		fclose (qcfiles[fileid].file);
+		qcfiles[fileid].file = NULL;
+		qcfiles[fileid].owningvm = NULL;
+	}
+}
+
+static void PF_frikfile_shutdown (void)
+{
+	size_t i;
+	for (i = 0; i < qcfiles_max; i++)
+	{
+		if (qcfiles[i].owningvm == qcvm)
+		{
+			fclose (qcfiles[i].file);
+			qcfiles[i].file = NULL;
+			qcfiles[i].owningvm = NULL;
+		}
+	}
+}
+
+// QuakeC can only handles int as offests/sizes
+// so technically QC fseek() can only manage files smaller than 2**31 bytes
+// which should be enough in all cases.
+static void PF_fseek (void)
+{
+	// returns current position. or changes that position.
+	size_t fileid = G_FLOAT (OFS_PARM0) - QC_FILE_BASE;
+	G_INT (OFS_RETURN) = 0;
+	if (fileid >= qcfiles_max)
+		Con_Warning ("PF_fread: invalid file handle\n");
+	else if (!qcfiles[fileid].file)
+		Con_Warning ("PF_fread: file not open\n");
+	else
+	{
+		if (qcfiles[fileid].mode == 0)
+			G_INT (OFS_RETURN) = (int)qcfiles[fileid].fileoffset; // when we're reading, use the cached read offset
+		else
+			G_INT (OFS_RETURN) = (int)Sys_ftell (qcfiles[fileid].file) - qcfiles[fileid].filebase;
+		if (qcvm->argc > 1)
+		{
+			qcfiles[fileid].fileoffset = G_INT (OFS_PARM1);
+			Sys_fseek (qcfiles[fileid].file, qcfiles[fileid].filebase + qcfiles[fileid].fileoffset, SEEK_SET);
+			qcfiles[fileid].cachesize = qcfiles[fileid].cacheoffset = 0;
+		}
+	}
+}
+
 static void PF_whichpack (void)
 {
 	const char	*fname = G_STRING (OFS_PARM0); // uses native paths, as this isn't actually reading anything.
@@ -3449,6 +3694,7 @@ static void PF_copyentity (void)
 	memcpy (&dst->v, &src->v, qcvm->edict_size - sizeof (entvars_t));
 	dst->alpha = src->alpha;
 	dst->sendinterval = src->sendinterval;
+	dst->sendinterval_default = src->sendinterval_default;
 	SV_LinkEdict (dst, false);
 
 	G_INT (OFS_RETURN) = EDICT_TO_PROG (dst);
@@ -4144,6 +4390,7 @@ static struct svcustomstat_s *PR_CustomStat (int idx, int type)
 	sv.customstats[i].ptr = NULL;
 	return &sv.customstats[i];
 }
+
 static void PF_clientstat (void)
 {
 	int					   idx = G_FLOAT (OFS_PARM0);
@@ -4154,6 +4401,37 @@ static void PF_clientstat (void)
 		return;
 	stat->fld = fldofs;
 }
+
+static void PF_globalstat (void)
+{
+	int					   idx = G_FLOAT (OFS_PARM0);
+	int					   type = G_FLOAT (OFS_PARM1);
+	const char			  *globname = G_STRING (OFS_PARM2);
+	eval_t				  *ptr = PR_FindExtGlobal (type, globname);
+	struct svcustomstat_s *stat;
+	if (ptr)
+	{
+		stat = PR_CustomStat (idx, type);
+		if (!stat)
+			return;
+		stat->ptr = ptr;
+	}
+}
+
+static void PF_pointerstat (void)
+{
+	int					   idx = G_FLOAT (OFS_PARM0);
+	int					   type = G_FLOAT (OFS_PARM1);
+	int					   qcptr = G_INT (OFS_PARM2);
+	struct svcustomstat_s *stat;
+	if (qcptr < 0 || qcptr >= qcvm->max_edicts * qcvm->edict_size || (qcptr % qcvm->edict_size) < sizeof (edict_t) - sizeof (entvars_t))
+		return; // invalid pointer. this is a more strict check than the qcvm...
+	stat = PR_CustomStat (idx, type);
+	if (!stat)
+		return;
+	stat->ptr = (eval_t *)((byte *)qcvm->edicts + qcptr);
+}
+
 static void PF_isbackbuffered (void)
 {
 	unsigned int plnum = G_EDICTNUM (OFS_PARM0) - 1;
@@ -4463,81 +4741,54 @@ static void PF_cl_getstat_string (void)
 	}
 }
 
-static struct
+static qpic_t *DrawQC_CachePic (const char *picname, int picflags)
 {
-	char		 name[MAX_QPATH];
-	unsigned int flags;
-	qpic_t		*pic;
-}			 *qcpics;
-static size_t numqcpics;
-static size_t maxqcpics;
-void		  PR_ReloadPics (qboolean purge)
-{
-	numqcpics = 0;
-
-	Mem_Free (qcpics);
-	qcpics = NULL;
-	maxqcpics = 0;
-}
-#define PICFLAG_AUTO   0		 // value used when no flags known
-#define PICFLAG_WAD	   (1u << 0) // name matches that of a wad lump
-#define PICFLAG_WRAP   (1u << 2) // make sure npot stuff doesn't break wrapping.
-#define PICFLAG_MIPMAP (1u << 3) // disable use of scrap...
-#define PICFLAG_BLOCK  (1u << 9) // wait until the texture is fully loaded.
-#define PICFLAG_NOLOAD (1u << 31)
-static qpic_t *DrawQC_CachePic (const char *picname, unsigned int flags)
-{ // okay, so this is silly. we've ended up with 3 different cache levels. qcpics, pics, and images.
-	size_t		 i;
-	unsigned int texflags;
-	for (i = 0; i < numqcpics; i++)
-	{ // binary search? something more sane?
-		if (!strcmp (picname, qcpics[i].name))
-		{
-			if (qcpics[i].pic)
-				return qcpics[i].pic;
-			break;
-		}
-	}
-
 	if (strlen (picname) >= MAX_QPATH)
 		return NULL; // too long. get lost.
 
-	if (flags & PICFLAG_NOLOAD)
-		return NULL; // its a query, not actually needed.
+	unsigned int texflags = TEXPREF_ALPHA | TEXPREF_PAD | TEXPREF_NOPICMIP;
 
-	if (i + 1 > maxqcpics)
-	{
-		maxqcpics = i + 32;
-		qcpics = Mem_Realloc (qcpics, maxqcpics * sizeof (*qcpics));
-	}
+	// cleanup picname of all its leading slashes or backslashes
+	// because sometimes the input is silly.
+	char tmp_qpic_name[MAX_QPATH] = {0};
 
-	strcpy (qcpics[i].name, picname);
-	qcpics[i].flags = flags;
-	qcpics[i].pic = NULL;
+	q_strlcpy (tmp_qpic_name, picname, MAX_QPATH);
 
-	texflags = TEXPREF_ALPHA | TEXPREF_PAD | TEXPREF_NOPICMIP;
-	if (flags & PICFLAG_WRAP)
+	char *clean_picname = &tmp_qpic_name[0];
+
+	// trim leading:
+	while (*clean_picname == '/' || *clean_picname == '\\')
+		clean_picname++;
+
+	// Fast lookup:
+	qpic_t *p = Draw_GetCachedPic (clean_picname);
+
+	if (p)
+		return p;
+
+	if (picflags & PICFLAG_NOLOAD)
+		return NULL; // only query the cached status.
+
+	// load a new pic:
+	if (picflags & PICFLAG_WRAP)
 		texflags &= ~TEXPREF_PAD; // don't allow padding if its going to need to wrap (even if we don't enable clamp-to-edge normally). I just hope we have
 								  // npot support.
-	if (flags & PICFLAG_MIPMAP)
+	if (picflags & PICFLAG_MIPMAP)
 		texflags |= TEXPREF_MIPMAP;
 
 	// try to load it from a wad if applicable.
 	// the extra gfx/ crap is because DP insists on it for wad images. and its a nightmare to get things working in all engines if we don't accept that quirk
 	// too.
-	if (flags & PICFLAG_WAD)
-		qcpics[i].pic = Draw_PicFromWad2 (picname + (strncmp (picname, "gfx/", 4) ? 0 : 4), texflags);
-	else if (!strncmp (picname, "gfx/", 4) && !strchr (picname + 4, '.'))
-		qcpics[i].pic = Draw_PicFromWad2 (picname + 4, texflags);
+	if (picflags & PICFLAG_WAD)
+		p = Draw_PicFromWad2 (clean_picname + (strncmp (clean_picname, "gfx/", 4) ? 0 : 4), texflags, picflags);
+	else if (!strncmp (clean_picname, "gfx/", 4) && !strchr (clean_picname + 4, '.'))
+		p = Draw_PicFromWad2 (clean_picname + 4, texflags, picflags);
 
-	// okay, not a wad pic, try and load a lmp/tga/etc
-	if (!qcpics[i].pic)
-		qcpics[i].pic = Draw_TryCachePic (picname, texflags);
+	// okay, not a wad pic, try and load a png/tga/jpg/pcx/lmp
+	if (!p || p == pic_nul)
+		p = Draw_TryCachePic (clean_picname, texflags, picflags);
 
-	if (i == numqcpics)
-		numqcpics++;
-
-	return qcpics[i].pic;
+	return p;
 }
 extern gltexture_t *char_texture;
 static void			DrawQC_CharacterQuad (cb_context_t *cbx, float x, float y, int num, float w, float h, float *rgb, float alpha)
@@ -4715,25 +4966,35 @@ static void PF_cl_drawresetclip (void)
 
 static void PF_cl_precachepic (void)
 {
-	const char	*name = G_STRING (OFS_PARM0);
-	unsigned int flags = G_FLOAT (OFS_PARM1);
+	const char *name = G_STRING (OFS_PARM0);
+	int			flags = (int)G_FLOAT (OFS_PARM1);
 
 	G_INT (OFS_RETURN) = G_INT (OFS_PARM0); // return input string, for convienience
 
-	if (!DrawQC_CachePic (name, flags) && (flags & PICFLAG_BLOCK))
+	SDL_LockMutex (draw_qcvm_mutex);
+
+	if (!DrawQC_CachePic (name, flags))
+		// failure to load because the pic 'name" was not found.
 		G_INT (OFS_RETURN) = 0; // return input string, for convienience
+
+	SDL_UnlockMutex (draw_qcvm_mutex);
 }
 static void PF_cl_iscachedpic (void)
 {
+	SDL_LockMutex (draw_qcvm_mutex);
 	const char *name = G_STRING (OFS_PARM0);
 	if (DrawQC_CachePic (name, PICFLAG_NOLOAD))
 		G_FLOAT (OFS_RETURN) = true;
 	else
 		G_FLOAT (OFS_RETURN) = false;
+
+	SDL_UnlockMutex (draw_qcvm_mutex);
 }
 
 static void PF_cl_drawpic (void)
 {
+	SDL_LockMutex (draw_qcvm_mutex);
+
 	float  *pos = G_VECTOR (OFS_PARM0);
 	qpic_t *pic = DrawQC_CachePic (G_STRING (OFS_PARM1), PICFLAG_AUTO);
 	float  *size = G_VECTOR (OFS_PARM2);
@@ -4742,19 +5003,27 @@ static void PF_cl_drawpic (void)
 
 	if (pic)
 		Draw_SubPic (vulkan_globals.secondary_cb_contexts[SCBX_GUI], pos[0], pos[1], size[0], size[1], pic, 0, 0, 1, 1, rgb, alpha);
+
+	SDL_UnlockMutex (draw_qcvm_mutex);
 }
 
 static void PF_cl_getimagesize (void)
 {
+	SDL_LockMutex (draw_qcvm_mutex);
+
 	qpic_t *pic = DrawQC_CachePic (G_STRING (OFS_PARM0), PICFLAG_AUTO);
 	if (pic)
 		G_VECTORSET (OFS_RETURN, pic->width, pic->height, 0);
 	else
 		G_VECTORSET (OFS_RETURN, 0, 0, 0);
+
+	SDL_UnlockMutex (draw_qcvm_mutex);
 }
 
 static void PF_cl_drawsubpic (void)
 {
+	SDL_LockMutex (draw_qcvm_mutex);
+
 	float  *pos = G_VECTOR (OFS_PARM0);
 	float  *size = G_VECTOR (OFS_PARM1);
 	qpic_t *pic = DrawQC_CachePic (G_STRING (OFS_PARM2), PICFLAG_AUTO);
@@ -4766,6 +5035,8 @@ static void PF_cl_drawsubpic (void)
 	if (pic)
 		Draw_SubPic (
 			vulkan_globals.secondary_cb_contexts[SCBX_GUI], pos[0], pos[1], size[0], size[1], pic, srcpos[0], srcpos[1], srcsize[0], srcsize[1], rgb, alpha);
+
+	SDL_UnlockMutex (draw_qcvm_mutex);
 }
 
 static void PF_cl_drawfill (void)
@@ -4822,7 +5093,7 @@ static void PF_cl_drawfill (void)
 	vulkan_globals.vk_cmd_draw (cbx->cb, 6, 1, 0, 0);
 }
 
-void PF_cl_playerkey_internal (int player, const char *key, qboolean retfloat)
+static void PF_cl_playerkey_internal (int player, const char *key, qboolean retfloat)
 {
 	char		buf[1024];
 	const char *ret = buf;
@@ -4899,6 +5170,73 @@ static void PF_cl_registercommand (void)
 	const char *cmdname = G_STRING (OFS_PARM0);
 	Cmd_AddCommand (cmdname, NULL);
 }
+
+static void PF_cl_serverkey_internal (const char *key, qboolean retfloat)
+{
+	char		buf[1024];
+	const char *ret;
+	if (!strcmp (key, "constate"))
+	{
+		if (cls.state != ca_connected)
+			ret = "disconnected";
+		else if (cls.signon == SIGNONS)
+			ret = "active";
+		else
+			ret = "connecting";
+	}
+	else
+	{
+		ret = Info_GetKey (cl.serverinfo, key, buf, sizeof (buf));
+	}
+
+	if (retfloat)
+		G_FLOAT (OFS_RETURN) = atof (ret);
+	else
+		G_INT (OFS_RETURN) = PR_SetEngineString (ret);
+}
+
+static void PF_cl_serverkey_s (void)
+{
+	const char *keyname = G_STRING (OFS_PARM0);
+	PF_cl_serverkey_internal (keyname, false);
+}
+static void PF_cl_serverkey_f (void)
+{
+	const char *keyname = G_STRING (OFS_PARM0);
+	PF_cl_serverkey_internal (keyname, true);
+}
+
+static void PF_sv_serverkey_internal (const char *key, qboolean retfloat)
+{
+	char		buf[1024];
+	const char *ret = Info_GetKey (svs.serverinfo, key, buf, sizeof (buf));
+
+	if (retfloat)
+		G_FLOAT (OFS_RETURN) = atof (ret);
+	else
+		G_INT (OFS_RETURN) = PR_SetEngineString (ret);
+}
+
+static void PF_sv_serverkey_s (void)
+{
+	const char *keyname = G_STRING (OFS_PARM0);
+	PF_sv_serverkey_internal (keyname, false);
+}
+
+static void PF_sv_serverkey_f (void)
+{
+	const char *keyname = G_STRING (OFS_PARM0);
+	PF_sv_serverkey_internal (keyname, true);
+}
+
+static void PF_sv_forceinfokey (void)
+{
+	int			edict = G_EDICTNUM (OFS_PARM0);
+	const char *keyname = G_STRING (OFS_PARM1);
+	const char *value = G_STRING (OFS_PARM2);
+	SV_UpdateInfo (edict, keyname, value);
+}
+
 static void PF_cl_readbyte (void)
 {
 	G_FLOAT (OFS_RETURN) = MSG_ReadByte ();
@@ -4992,6 +5330,196 @@ static void PF_checkpvs (void)
 	G_FLOAT (OFS_RETURN) = false;
 }
 
+enum getrenderentityfield_e
+{
+	// DP's range
+	GE_MAXENTS = -1,
+	GE_ACTIVE = 0,
+	GE_ORIGIN = 1,
+	GE_FORWARD = 2,
+	GE_RIGHT = 3,
+	GE_UP = 4,
+	GE_SCALE = 5,
+	GE_ORIGINANDVECTORS = 6,
+	GE_ALPHA = 7,
+	GE_COLORMOD = 8,
+	// GE_PANTSCOLOR = 9,
+	// GE_SHIRTCOLOR = 10,
+	GE_SKIN = 11,
+	//	GE_MINS				= 12,
+	//	GE_MAXS				= 13,
+	//	GE_ABSMIN			= 14,
+	//	GE_ABSMAX			= 15,
+	//	GE_LIGHT			= 16,
+
+	// FTE's range.
+	GE_MODELINDEX = 200,
+	//	GE_MODELINDEX2		= 201,
+	GE_EFFECTS = 202,
+	GE_FRAME = 203,
+	GE_ANGLES = 204,
+	//	GE_FATNESS			= 205,
+	//	GE_DRAWFLAGS		= 206,
+	//	GE_ABSLIGHT			= 207,
+	//	GE_GLOWMOD			= 208,
+	//	GE_GLOWSIZE			= 209,
+	//	GE_GLOWCOLOUR		= 210,
+	//	GE_RTSTYLE			= 211,
+	//	GE_RTPFLAGS			= 212,
+	//	GE_RTCOLOUR			= 213,
+	//	GE_RTRADIUS			= 214,
+	GE_TAGENTITY = 215,
+	GE_TAGINDEX = 216,
+	//	GE_GRAVITYDIR		= 217,
+	GE_TRAILEFFECTNUM = 218,
+};
+static void PF_cl_getrenderentity (void)
+{
+	vec3_t						tmp;
+	size_t						entnum = G_FLOAT (OFS_PARM0);
+	enum getrenderentityfield_e fldnum = G_FLOAT (OFS_PARM1);
+
+#if 0 // vso : Always authorize it, who cares...
+	if (qcvm->nogameaccess)
+	{
+		G_FLOAT (OFS_RETURN + 0) = 0;
+		G_FLOAT (OFS_RETURN + 1) = 0;
+		G_FLOAT (OFS_RETURN + 2) = 0;
+		Con_Printf ("PF_getrenderentity: not permitted\n");
+		return;
+	}
+#endif
+
+	if (fldnum == GE_MAXENTS)
+		G_FLOAT (OFS_RETURN + 0) = cl.num_entities;
+	else if (entnum >= cl.num_entities || !cl.entities[entnum].model)
+	{
+		G_FLOAT (OFS_RETURN + 0) = 0;
+		G_FLOAT (OFS_RETURN + 1) = 0;
+		G_FLOAT (OFS_RETURN + 2) = 0;
+	}
+	else
+		switch (fldnum)
+		{
+		case GE_ACTIVE:
+			G_FLOAT (OFS_RETURN + 0) = true;
+			break;
+		case GE_ORIGIN:
+			VectorCopy (cl.entities[entnum].origin, G_VECTOR (OFS_RETURN));
+			break;
+		case GE_ORIGINANDVECTORS:
+			VectorCopy (cl.entities[entnum].origin, G_VECTOR (OFS_RETURN));
+			VectorCopy (cl.entities[entnum].angles, tmp);
+			if (cl.entities[entnum].model->type == mod_alias)
+				tmp[0] *= -1;
+			AngleVectors (tmp, pr_global_struct->v_forward, pr_global_struct->v_right, pr_global_struct->v_up);
+			break;
+		case GE_FORWARD:
+			VectorCopy (cl.entities[entnum].angles, tmp);
+			if (cl.entities[entnum].model->type == mod_alias)
+				tmp[0] *= -1;
+			AngleVectors (tmp, G_VECTOR (OFS_RETURN), tmp, tmp);
+			break;
+		case GE_RIGHT:
+			VectorCopy (cl.entities[entnum].angles, tmp);
+			if (cl.entities[entnum].model->type == mod_alias)
+				tmp[0] *= -1;
+			AngleVectors (tmp, tmp, G_VECTOR (OFS_RETURN), tmp);
+			break;
+		case GE_UP:
+			VectorCopy (cl.entities[entnum].angles, tmp);
+			if (cl.entities[entnum].model->type == mod_alias)
+				tmp[0] *= -1;
+			AngleVectors (tmp, tmp, tmp, G_VECTOR (OFS_RETURN));
+			break;
+		case GE_SCALE:
+			G_FLOAT (OFS_RETURN + 0) = ENTSCALE_DECODE (cl.entities[entnum].netstate.scale);
+			break;
+		case GE_ALPHA:
+			G_FLOAT (OFS_RETURN + 0) = ENTALPHA_DECODE (cl.entities[entnum].alpha);
+			break;
+		case GE_COLORMOD:
+			G_FLOAT (OFS_RETURN + 0) = cl.entities[entnum].netstate.colormod[0] / 32.0;
+			G_FLOAT (OFS_RETURN + 1) = cl.entities[entnum].netstate.colormod[1] / 32.0;
+			G_FLOAT (OFS_RETURN + 2) = cl.entities[entnum].netstate.colormod[2] / 32.0;
+			break;
+		/*
+		case GE_PANTSCOLOR:
+		{
+			int	  palidx = cl.entities[entnum].netstate.colormap;
+			byte *pal;
+			if ((cl.entities[entnum].netstate.eflags & EFLAGS_COLOURMAPPED) || palidx >= cl.maxclients)
+				pal = (byte *)d_8to24table + 4 * Sbar_ColorForMap (palidx & 0x0f);
+			else
+				pal = CL_PLColours_ToRGB (&cl.scores[palidx].pants);
+			G_FLOAT (OFS_RETURN + 0) = pal[0] / 255.0;
+			G_FLOAT (OFS_RETURN + 1) = pal[1] / 255.0;
+			G_FLOAT (OFS_RETURN + 2) = pal[2] / 255.0;
+		}
+		break;
+		case GE_SHIRTCOLOR:
+		{
+			int	  palidx = cl.entities[entnum].netstate.colormap;
+			byte *pal;
+			if ((cl.entities[entnum].netstate.eflags & EFLAGS_COLOURMAPPED) || palidx >= cl.maxclients)
+				pal = (byte *)d_8to24table + 4 * Sbar_ColorForMap (palidx & 0xf0);
+			else
+				pal = CL_PLColours_ToRGB (&cl.scores[palidx].shirt);
+			G_FLOAT (OFS_RETURN + 0) = pal[0] / 255.0;
+			G_FLOAT (OFS_RETURN + 1) = pal[1] / 255.0;
+			G_FLOAT (OFS_RETURN + 2) = pal[2] / 255.0;
+		}
+		break;
+		*/
+		case GE_SKIN:
+			G_FLOAT (OFS_RETURN + 0) = cl.entities[entnum].skinnum;
+			break;
+			//	case GE_MINS:
+			//	case GE_MAXS:
+			//	case GE_ABSMIN:
+			//	case GE_ABSMAX:
+			//	case GE_LIGHT:
+		case GE_MODELINDEX:
+			G_FLOAT (OFS_RETURN + 0) = cl.entities[entnum].netstate.modelindex;
+			break;
+			//	case GE_MODELINDEX2:
+		case GE_EFFECTS:
+			G_FLOAT (OFS_RETURN + 0) = cl.entities[entnum].effects;
+			break;
+		case GE_FRAME:
+			G_FLOAT (OFS_RETURN + 0) = cl.entities[entnum].frame;
+			break;
+		case GE_ANGLES:
+			VectorCopy (cl.entities[entnum].angles, G_VECTOR (OFS_RETURN));
+			break;
+			//	case GE_FATNESS:
+			//	case GE_DRAWFLAGS:
+			//	case GE_ABSLIGHT:
+			//	case GE_GLOWMOD:
+			//	case GE_GLOWSIZE:
+			//	case GE_GLOWCOLOUR:
+			//	case GE_RTSTYLE:
+			//	case GE_RTPFLAGS:
+			//	case GE_RTCOLOUR:
+			//	case GE_RTRADIUS:
+		case GE_TAGENTITY:
+			G_FLOAT (OFS_RETURN + 0) = cl.entities[entnum].netstate.tagentity;
+			break;
+		case GE_TAGINDEX:
+			G_FLOAT (OFS_RETURN + 0) = cl.entities[entnum].netstate.tagindex;
+			break;
+			//	case GE_GRAVITYDIR:
+		case GE_TRAILEFFECTNUM:
+			G_FLOAT (OFS_RETURN + 0) = cl.entities[entnum].netstate.traileffectnum;
+			break;
+
+		case GE_MAXENTS:
+		default:
+			Con_Printf ("PF_cl_getrenderentity(,%i): not implemented\n", fldnum);
+			break;
+		}
+}
+
 // A quick note on number ranges.
 // 0: automatically assigned. more complicated, but no conflicts over numbers, just names...
 //    NOTE: #0 is potentially ambiguous - vanilla will interpret it as instruction 0 (which is normally reserved) rather than a builtin.
@@ -5041,6 +5569,11 @@ static struct
 	{"checkbuiltin",				PF_checkbuiltin,				PF_checkbuiltin,				0,		D("float(__variant funcref)", "Checks to see if the specified builtin is supported/mapped. This is intended as a way to check for #0 functions, allowing for simple single-builtin functions.")},
 	{"builtin_find",				PF_builtinsupported,			PF_builtinsupported,			100,	D("float(string builtinname)", "Looks to see if the named builtin is valid, and returns the builtin number it exists at.")},	// #100	//per builtin system.
 	{"anglemod",					PF_anglemod,					PF_anglemod,					102,	"float(float value)"},	//telejano
+	{"fopen",						PF_fopen,						PF_fopen,						110,	D("filestream(string filename, float mode, optional float mmapminsize)", "Opens a file, typically prefixed with \"data/\", for either read or write access.")},	// (FRIK_FILE)
+	{"fclose",						PF_fclose,						PF_fclose,						111,	"void(filestream fhandle)"},	// (FRIK_FILE)
+	{"fgets",						PF_fgets,						PF_fgets,						112,	D("string(filestream fhandle)", "Reads a single line out of the file. The new line character is not returned as part of the string. Returns the null string on EOF (use if not(string) to easily test for this, which distinguishes it from the empty string which is returned if the line being read is blank")},	// (FRIK_FILE)
+	{"fputs",						PF_fputs,						PF_fputs,						113,	D("void(filestream fhandle, string s, optional string s2, optional string s3, optional string s4, optional string s5, optional string s6, optional string s7)", "Writes the given string(s) into the file. For compatibility with fgets, you should ensure that the string is terminated with a \\n - this will not otherwise be done for you. It is up to the engine whether dos or unix line endings are actually written.")},	// (FRIK_FILE)
+	{"fseek",						PF_fseek,						PF_fseek,						0,		D("#define ftell fseek //c-compat\nint(filestream fhandle, optional int newoffset)", "Changes the current position of the file, if specified. Returns prior position, in bytes.")},
 	{"strlen",						PF_strlen,						PF_strlen,						114,	"float(string s)"},	// (FRIK_FILE)
 	{"strcat",						PF_strcat,						PF_strcat,						115,	"string(string s1, optional string s2, optional string s3, optional string s4, optional string s5, optional string s6, optional string s7, optional string s8)"},	// (FRIK_FILE)
 	{"substring",					PF_substring,					PF_substring,					116,	"string(string s, float start, float length)"},	// (FRIK_FILE)
@@ -5049,6 +5582,7 @@ static struct
 	{"strunzone",					PF_strunzone,					PF_strunzone,					119,	D("void(string s)", "Destroys a string that was allocated by strunzone. Further references to the string MAY crash the game.")},	// (FRIK_FILE)
 	{"tokenize_menuqc",				PF_Tokenize,					PF_Tokenize,					0,		"float(string s)"},
 	{"localsound",					PF_NoSSQC,						PF_cl_localsound,				177,	D("void(string soundname, optional float channel, optional float volume)", "Plays a sound... locally... probably best not to call this from ssqc. Also disables reverb.")},//	#177
+	{"forceinfokey",	            PF_sv_forceinfokey,	            PF_NoCSQC,			            213,	D("void(entity player, string key, string value)", "Directly changes a user's info without pinging off the client. Also allows explicitly setting * keys, including *spectator. Does not affect the user's config or other servers.")}, // #213
 	{"bitshift",					PF_bitshift,					PF_bitshift,					218,	"float(float number, float quantity)"},
 	{"te_lightningblood",			PF_sv_te_lightningblood,		NULL,							219,	"void(vector org)"},
 	{"strstrofs",					PF_strstrofs,					PF_strstrofs,					221,	D("float(string s1, string sub, optional float startidx)", "Returns the 0-based offset of sub within the s1 string, or -1 if sub is not in s1.\nIf startidx is set, this builtin will ignore matches before that 0-based offset.")},
@@ -5063,6 +5597,8 @@ static struct
 	{"strncasecmp",					PF_strncasecmp,					PF_strncasecmp,					230,	D("float(string s1, string s2, float len, optional float s1ofs, optional float s2ofs)", "Compares up to 'len' chars in the two strings without case sensitivity. s1ofs allows you to treat s2 as a substring to compare against, or should be 0.\nReturns 0 if they are equal. The sign of the return value may be significant, but should not be depended upon.")},
 	{"strtrim",						PF_strtrim,						PF_strtrim,						0,		D("string(string s)", "Trims the whitespace from the start+end of the string.")},
 	{"clientstat",					PF_clientstat,					PF_NoCSQC,						232,	D("void(float num, float type, .__variant fld)", "Specifies what data to use in order to send various stats, in a client-specific way.\n'num' should be a value between 32 and 127, other values are reserved.\n'type' must be set to one of the EV_* constants, one of EV_FLOAT, EV_STRING, EV_INTEGER, EV_ENTITY.\nfld must be a reference to the field used, each player will be sent only their own copy of these fields.")},	//EXT_CSQC
+	{"globalstat",					PF_globalstat,					PF_NoCSQC,						233,	D("void(float num, float type, string name)", "Specifies what data to use in order to send various stats, in a non-client-specific way. num and type are as in clientstat, name however, is the name of the global to read in the form of a string (pass \"foo\").")},	//EXT_CSQC_1 actually
+	{"pointerstat",					PF_pointerstat,					PF_NoCSQC,						0,		D("void(float num, float type, __variant *address)", "Specifies what data to use in order to send various stats, in a non-client-specific way. num and type are as in clientstat, address however, is the address of the variable you would like to use (pass &foo).")},
 	{"isbackbuffered",				PF_isbackbuffered,				PF_NoCSQC,						234,	D("float(entity player)", "Returns if the given player's network buffer will take multiple network frames in order to clear. If this builtin returns non-zero, you should delay or reduce the amount of reliable (and also unreliable) data that you are sending to that client.")},
 	{"te_bloodqw",					PF_sv_te_bloodqw,				NULL,							239,	"void(vector org, float count)"},
 	{"checkpvs",					PF_checkpvs,					PF_checkpvs,					240,	"float(vector viewpos, entity entity)"},
@@ -5106,10 +5642,12 @@ static struct
 	{"trailparticles",				PF_sv_trailparticles,			PF_cl_trailparticles,			336,	D("void(float effectnum, entity ent, vector start, vector end)", "Draws the given effect between the two named points. If ent is not world, distances will be cached in the entity in order to avoid framerate dependancies. The entity is not otherwise used.")},// (EXT_CSQC),
 	{"pointparticles",				PF_sv_pointparticles,			PF_cl_pointparticles,			337,	D("void(float effectnum, vector origin, optional vector dir, optional float count)", "Spawn a load of particles from the given effect at the given point traveling or aiming along the direction specified. The number of particles are scaled by the count argument.")},// (EXT_CSQC)
 	{"print",						PF_print,						PF_print,						339,	D("void(string s, ...)", "Unconditionally print on the local system's console, even in ssqc (doesn't care about the value of the developer cvar).")},//(EXT_CSQC)
-	{"getplayerkeyvalue",			NULL,							PF_cl_playerkey_s,				348,	D("string(float playernum, string keyname)", "Look up a player's userinfo, to discover things like their name, topcolor, bottomcolor, skin, team, *ver.\nAlso includes scoreboard info like frags, ping, pl, userid, entertime, as well as voipspeaking and voiploudness.")},// (EXT_CSQC)
-	{"getplayerkeyfloat",			NULL,							PF_cl_playerkey_f,				0,		D("float(float playernum, string keyname, optional float assumevalue)", "Cheaper version of getplayerkeyvalue that avoids the need for so many tempstrings.")},
-	{"registercommand",				NULL,							PF_cl_registercommand,			352,	D("void(string cmdname)", "Register the given console command, for easy console use.\nConsole commands that are later used will invoke CSQC_ConsoleCommand.")},//(EXT_CSQC)
+	{"getplayerkeyvalue",			PF_NoSSQC,						PF_cl_playerkey_s,				348,	D("string(float playernum, string keyname)", "Look up a player's userinfo, to discover things like their name, topcolor, bottomcolor, skin, team, *ver.\nAlso includes scoreboard info like frags, ping, pl, userid, entertime, as well as voipspeaking and voiploudness.")},// (EXT_CSQC)
+	{"getplayerkeyfloat",			PF_NoSSQC,						PF_cl_playerkey_f,				0,		D("float(float playernum, string keyname, optional float assumevalue)", "Cheaper version of getplayerkeyvalue that avoids the need for so many tempstrings.")},
+	{"registercommand",				PF_NoSSQC,						PF_cl_registercommand,			352,	D("void(string cmdname)", "Register the given console command, for easy console use.\nConsole commands that are later used will invoke CSQC_ConsoleCommand.")},//(EXT_CSQC)
 	{"wasfreed",					PF_WasFreed,					PF_WasFreed,					353,	D("float(entity ent)", "Quickly check to see if the entity is currently free. This function is only valid during the two-second non-reuse window, after that it may give bad results. Try one second to make it more robust.")},//(EXT_CSQC) (should be availabe on server too)
+	{"serverkey",					PF_sv_serverkey_s,				PF_cl_serverkey_s,				354,	D("string(string key)", "Look up a key in the server's public serverinfo string")},//
+	{"serverkeyfloat",				PF_sv_serverkey_f,				PF_cl_serverkey_f,				0,		D("float(string key, optional float assumevalue)", "Version of serverkey that returns the value as a float (which avoids tempstrings).")},//
 	{"readbyte",					PF_NoSSQC,						PF_cl_readbyte,					360,	"float()"},// (EXT_CSQC)
 	{"readchar",					PF_NoSSQC,						PF_cl_readchar,					361,	"float()"},// (EXT_CSQC)
 	{"readshort",					PF_NoSSQC,						PF_cl_readshort,				362,	"float()"},// (EXT_CSQC)
@@ -5200,6 +5738,7 @@ static struct
 	{"getentityfieldstring",		PF_getentfldstr,				PF_getentfldstr,				499,	"string(float fieldnum, entity ent)"},//DP_QC_ENTITYDATA
 	{"putentityfieldstring",		PF_putentfldstr,				PF_putentfldstr,				500,	"float(float fieldnum, entity ent, string s)"},//DP_QC_ENTITYDATA
 	{"whichpack",					PF_whichpack,					PF_whichpack,					503,	D("string(string filename, optional float makereferenced)", "Returns the pak file name that contains the file specified. progs/player.mdl will generally return something like 'pak0.pak'. If makereferenced is true, clients will automatically be told that the returned package should be pre-downloaded and used, even if allow_download_refpackages is not set.")},//DP_QC_WHICHPACK
+	{"getentity",					PF_NoSSQC,						PF_cl_getrenderentity,			504,	D("__variant(float entnum, float fieldnum)", "Looks up fields from non-csqc-visible entities. The entity will need to be within the player's pvs. fieldnum should be one of the GE_ constants.")},//DP_CSQC_QUERYRENDERENTITY
 	{"uri_escape",					PF_uri_escape,					PF_uri_escape,					510,	"string(string in)"},//DP_QC_URI_ESCAPE
 	{"uri_unescape",				PF_uri_unescape,				PF_uri_unescape,				511,	"string(string in)"},//DP_QC_URI_ESCAPE
 	{"num_for_edict",				PF_num_for_edict,				PF_num_for_edict,				512,	"float(entity ent)"},//DP_QC_NUM_FOR_EDICT
@@ -5219,7 +5758,7 @@ static struct
 	{"getsurfacenumtriangles",		PF_getsurfacenumtriangles,		PF_getsurfacenumtriangles,		628,	"float(entity e, float s)"},
 	{"getsurfacetriangle",			PF_getsurfacetriangle,			PF_getsurfacetriangle,			629,	"vector(entity e, float s, float n)"},
 	{"digest_hex",					PF_digest_hex,					PF_digest_hex,					639,	"string(string digest, string data, ...)"},
-	// Quake 2021 rerelease update 3
+	// Quake 2021 re-release update 3
 	{"ex_centerprint",				PF_centerprint,					PF_NoCSQC,						0,		"void(entity client, string s, ...)"},
 	{"ex_bprint",					PF_bprint,						PF_NoCSQC,						0,		"void(string s, ...)"},
 	{"ex_sprint",					PF_sprint,						PF_NoCSQC,						0,		"void(entity client, string s, ...)"},
@@ -5227,17 +5766,18 @@ static struct
 	{"ex_CheckPlayerEXFlags",		PF_sv_CheckPlayerEXFlags,		PF_NoCSQC,						0,		"float(entity playerEnt)"},
 	{"ex_walkpathtogoal",			PF_sv_walkpathtogoal,			PF_NoCSQC,						0,		"float(float movedist, vector goal)"},
 	{"ex_localsound",				PF_sv_localsound,				PF_NoCSQC,						0,		"void(entity client, string sample)"},
-	{"ex_draw_point",				PF_Fixme,						PF_NoCSQC,						0,		"void(vector point, float colormap, float lifetime, float depthtest)"},
-	{"ex_draw_line",				PF_Fixme,						PF_NoCSQC,						0,		"void(vector start, vector end, float colormap, float lifetime, float depthtest)"},
-	{"ex_draw_arrow",				PF_Fixme,						PF_NoCSQC,						0,		"void(vector start, vector end, float colormap, float size, float lifetime, float depthtest)"},
-	{"ex_draw_ray",					PF_Fixme,						PF_NoCSQC,						0,		"void(vector start, vector direction, float length, float colormap, float size, float lifetime, float depthtest)"},
-	{"ex_draw_circle",				PF_Fixme,						PF_NoCSQC,						0,		"void(vector origin, float radius, float colormap, float lifetime, float depthtest)"},
-	{"ex_draw_bounds",				PF_Fixme,						PF_NoCSQC,						0,		"void(vector min, vector max, float colormap, float lifetime, float depthtest)"},
-	{"ex_draw_worldtext",			PF_Fixme,						PF_NoCSQC,						0,		"void(string s, vector origin, float size, float lifetime, float depthtest)"},
-	{"ex_draw_sphere",				PF_Fixme,						PF_NoCSQC,						0,		"void(vector origin, float radius, float colormap, float lifetime, float depthtest)"},
-	{"ex_draw_cylinder",			PF_Fixme,						PF_NoCSQC,						0,		"void(vector origin, float halfHeight, float radius, float colormap, float lifetime, float depthtest)"},
-	{"ex_bot_movetopoint",			PF_Fixme,						PF_NoCSQC,						0,		"float(entity bot, vector point)"},
-	{"ex_bot_followentity",			PF_Fixme,						PF_NoCSQC,						0,		"float(entity bot, entity goal)"},
+	// Used in Quake 2026 re-relase update mg3: Not implemented in our side.
+	{"ex_draw_point",				PF_NotImplemented,			    PF_NoCSQC,						0,		"void(vector point, float colormap, float lifetime, float depthtest)"},
+	{"ex_draw_line",				PF_NotImplemented,				PF_NoCSQC,						0,		"void(vector start, vector end, float colormap, float lifetime, float depthtest)"},
+	{"ex_draw_arrow",				PF_NotImplemented,				PF_NoCSQC,						0,		"void(vector start, vector end, float colormap, float size, float lifetime, float depthtest)"},
+	{"ex_draw_ray",					PF_NotImplemented,				PF_NoCSQC,						0,		"void(vector start, vector direction, float length, float colormap, float size, float lifetime, float depthtest)"},
+	{"ex_draw_circle",				PF_NotImplemented,				PF_NoCSQC,						0,		"void(vector origin, float radius, float colormap, float lifetime, float depthtest)"},
+	{"ex_draw_bounds",				PF_NotImplemented,				PF_NoCSQC,						0,		"void(vector min, vector max, float colormap, float lifetime, float depthtest)"},
+	{"ex_draw_worldtext",			PF_NotImplemented,				PF_NoCSQC,						0,		"void(string s, vector origin, float size, float lifetime, float depthtest)"},
+	{"ex_draw_sphere",				PF_NotImplemented,				PF_NoCSQC,						0,		"void(vector origin, float radius, float colormap, float lifetime, float depthtest)"},
+	{"ex_draw_cylinder",			PF_NotImplemented,				PF_NoCSQC,						0,		"void(vector origin, float halfHeight, float radius, float colormap, float lifetime, float depthtest)"},
+	{"ex_bot_movetopoint",			PF_NotImplemented,				PF_NoCSQC,						0,		"float(entity bot, vector point)"},
+	{"ex_bot_followentity",			PF_NotImplemented,				PF_NoCSQC,						0,		"float(entity bot, entity goal)"},
 };
 // clang-format on
 
@@ -5284,6 +5824,7 @@ static struct
 } qcextensions[] = {
 	{"DP_CON_SET"},
 	{"DP_CON_SETA"},
+	{"DP_CSQC_QUERYRENDERENTITY"},
 	//	{"DP_EF_NOSHADOW"},
 	{"DP_ENT_ALPHA", PR_Can_Ent_Alpha}, // already in quakespasm, supposedly.
 	{"DP_ENT_COLORMOD", PR_Can_Ent_ColorMod},
@@ -5342,6 +5883,7 @@ static struct
 #endif
 	{"DP_TE_STANDARDEFFECTBUILTINS"},
 	{"EXT_BITSHIFT"},
+	{"FRIK_FILE"},
 //	{"FTE_ENT_SKIN_CONTENTS"}, // SOLID_BSP&&skin==CONTENTS_FOO changes CONTENTS_SOLID to CONTENTS_FOO, allowing you to swim in moving ents without qc hacks,
 //							   // as well as correcting view cshifts etc.
 #ifdef PSET_SCRIPT
@@ -5354,6 +5896,7 @@ static struct
 	{"FTE_QC_CHECKCOMMAND"},
 	{"FTE_QC_CROSSPRODUCT"},
 	{"FTE_QC_INFOKEY"},
+	{"FTE_FORCEINFOKEY"},
 	{"FTE_QC_INTCONV"},
 	{"FTE_QC_MULTICAST"},
 	{"FTE_STRINGS"},
@@ -5544,6 +6087,7 @@ void PF_Fixme (void)
 void PR_ShutdownExtensions (void)
 {
 	PR_UnzoneAll ();
+	PF_frikfile_shutdown ();
 	PF_buf_shutdown ();
 	tokenize_flush ();
 	pr_ext_warned_particleeffectnum = 0;
@@ -5771,7 +6315,7 @@ void PR_DumpPlatform_f (void)
 	q_snprintf (name, sizeof (name), "%s/src/%s", com_gamedir, outname);
 	COM_AddExtension (name, ".qc", sizeof (name));
 
-	f = fopen (name, "w");
+	f = Sys_fopen (name, "w");
 	if (!f)
 	{
 		Con_Printf ("%s: Couldn't write %s\n", Cmd_Argv (0), name);

@@ -46,6 +46,8 @@ enum m_state_e
 	m_search,
 	m_slist,
 	m_mods,
+	m_maps,
+	m_skill,
 };
 
 extern enum m_state_e m_state;
@@ -90,9 +92,9 @@ qboolean M_HandleScrollBarKeys (const int key, int *cursor, int *first_drawn, co
 #define MENU_TOP		 40
 #define MENU_CURSOR_X	 60
 #define MENU_LABEL_X	 70
-#define MENU_VALUE_X	 204
+#define MENU_VALUE_X	 (27 * CHARACTER_SIZE)
 #define MENU_SLIDER_X	 (MENU_VALUE_X + 6)
-#define MENU_SCROLLBAR_X (312 + (48)) // make some room for slider labels
+#define MENU_SCROLLBAR_X (46 * CHARACTER_SIZE) // make some room for slider labels
 #define MAX_MENU_LINES	 14
 
 // Max FPS menu entry is a slider [10 .. 1000; no limit] by steps of 2 fps so we can set 72 fps
@@ -102,13 +104,18 @@ qboolean M_HandleScrollBarKeys (const int key, int *cursor, int *first_drawn, co
 
 typedef struct crosshair_s
 {
-	char  crosshair_char;
-	float viewport_x_offset;
-	float viewport_y_offset;
-	int	  menu_x_offset;
-	int	  menu_y_offset;
+	const char *name;
+	char		crosshair_char;
+	float		viewport_x_offset;
+	float		viewport_y_offset;
+	int			menu_x_offset;
+	int			menu_y_offset;
+	const char *pic_path; // NULL for the legacy character crosshairs
 } crosshair_t;
 
 crosshair_t M_GetCrosshairDef (float crosshair_def_value);
+const char *M_GetCrosshairColorName (float crosshair_color_value);
+void		M_GetCrosshairColor (float crosshair_color_value, float *rgb);
+void		M_DrawCrosshair (cb_context_t *cbx, float x, float y, float size);
 
 #endif /* _QUAKE_MENU_H */

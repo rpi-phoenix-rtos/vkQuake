@@ -11,6 +11,7 @@ Improvements over QuakeSpasm include:
 * When both Classic and Enhanced versions of models exist, display one or other kind using the Models menu option.
 * True color skins support (`.png`, `.tga`, `.jpg`) for MD3/MD5 models, including fullbrights (from QSS)
 * Dynamic shadows (requires a GPU with ray tracing support)
+* Dynamic lights, using 2021 rerelease `dynamiclight` entities (requires a GPU with ray tracing support and "Dynamic Shadows" set to medium or higher)
 * Better color precision reducing banding in dark areas
 * Native support for anti aliasing and anisotropic filtering
 * 8-bit color emulation
@@ -29,7 +30,7 @@ Windows and Linux binaries can be found in [Releases](https://github.com/Novum/v
 MacOS (both Apple Silicon and 64-bit Intel) binaries are at [Mac Source Ports](https://www.macsourceports.com/game/quake).
 
 ### Windows
-It is recommended to use the installer on Windows. This sets up start menu entries for the original and remastered Quake versions. Save data and config files will be written to the user folder (`%APPDATA\vkQuake`) instead of the Quake data folder.
+It is recommended to use the installer on Windows. This sets up start menu entries for the classic and remastered Quake versions. The engine finds Steam, GOG and Epic Games Store installs automatically; otherwise it asks for the game folder once and remembers it. Save data and config files will be written to the user folder (`%APPDATA%\vkQuake`) instead of the Quake data folder.
 
 Otherwise copy all files inside the `vkquake-<version>_windows_x64.zip` (Intel) or `vkquake-<version>_windows_arm64.zip` (Arm64) folder in the zip to the Quake base directory. Overwrite any existing files. Afterward to run the game just execute `vkQuake.exe`.
 
@@ -121,6 +122,15 @@ make -f Makefile.w64a
 
 If you are on Linux and want to cross-compile for Windows, see the `build_cross_win??.sh` scripts.
 
+#### Meson
+
+With [Meson](https://mesonbuild.com/), [Ninja](https://ninja-build.org/) and a compiler installed (LLVM/Clang on PATH, or run `meson setup --vsenv build` for MSVC):
+
+~~~
+cd vkQuake
+meson setup build && ninja -C build
+~~~
+
 ### Linux
 
 Make sure that both your GPU and your GPU driver support [Vulkan](https://en.wikipedia.org/wiki/Vulkan#Support_across_vendors).
@@ -129,18 +139,20 @@ To compile vkQuake, first install the build dependencies:
 
 Ubuntu:
 ~~~
-apt-get install git meson gcc glslang-tools spirv-tools libsdl2-dev libvulkan-dev libvorbis-dev libmpg123-dev libx11-xcb-dev
+apt-get install git meson gcc glslang-tools spirv-tools libsdl3-dev libvulkan-dev libvorbis-dev libmpg123-dev libx11-xcb-dev
 ~~~
 
 Arch Linux:
 ~~~
-pacman -S git meson flac glibc libgl mpg123 libvorbis libx11 sdl2 vulkan-headers glslang spirv-tools
+pacman -S git meson flac glibc libgl mpg123 libvorbis libx11 sdl3 vulkan-headers glslang spirv-tools
 ~~~
 
 Fedora:
 ~~~
-dnf install git meson gcc glslang spirv-tools vulkan-loader-devel SDL2-devel mpg123-devel libvorbis-devel flac-devel opusfile-devel
+dnf install git meson gcc glslang spirv-tools vulkan-loader-devel SDL3-devel mpg123-devel libvorbis-devel flac-devel opusfile-devel
 ~~~
+
+On distributions that do not ship SDL3 yet, install the SDL2 development package instead (e.g. `libsdl2-dev`); the build falls back to SDL2 automatically.
 
 Then clone the vkQuake repo:
 
@@ -155,8 +167,10 @@ cd vkQuake
 meson build -Ddebug=true -Dstrip=false && ninja -C build
 ~~~
 
+Meson prefers SDL3 and falls back to SDL2 if it is not installed; add `-Duse_sdl3=disabled` to force SDL2 (or `enabled` to require SDL3).
+
 > **Note**\
-> The Meson version needs to be 0.47.0 or newer. For older distributions you can use make:
+> The Meson version needs to be 1.3.0 or newer. For older distributions you can use make:
 > ~~~
 > cd vkQuake/Quake
 > make -j
@@ -164,14 +178,14 @@ meson build -Ddebug=true -Dstrip=false && ninja -C build
 > Meson is the preferred way to build vkQuake because it automatically checks for out of date file depenencies, is faster and has better error reporting for missing dependencies.
 
 > **Note**\
-> vkQuake 0.97 and later requires at least **SDL2 2.0.6 with enabled Vulkan support**. The precompiled versions in some of the distribution repositories (e.g. Ubuntu) do not currently ship with Vulkan support. You will therefore need to compile it from source. Make sure you have libvulkan-dev installed before running configure.
+> vkQuake requires **SDL3** or, as a fallback for older distributions, at least **SDL2 2.0.6 with enabled Vulkan support**.
 
 ### MacOS
 
 To compile vkQuake, first install the build dependencies with Homebrew:
 
 ~~~
-brew install molten-vk vulkan-headers glslang spirv-tools sdl2 libvorbis flac opus opusfile flac mpg123 meson pkgconfig
+brew install molten-vk vulkan-headers glslang spirv-tools sdl3 libvorbis flac opus opusfile flac mpg123 meson pkgconfig
 ~~~
 
 Then clone the vkQuake repo:
@@ -187,8 +201,10 @@ cd vkQuake
 meson build -Ddebug=true -Dstrip=false && ninja -C build
 ~~~
 
+Meson prefers SDL3 and falls back to SDL2 if it is not installed; add `-Duse_sdl3=disabled` to force SDL2 (or `enabled` to require SDL3).
+
 > **Note**\
-> The Meson version needs to be 0.47.0 or newer.
+> The Meson version needs to be 1.3.0 or newer.
 
 ## Error reporting
 

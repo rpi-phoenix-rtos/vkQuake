@@ -72,11 +72,10 @@ typedef struct
 
 #define LIGHTMAP_BYTES 4
 
-#define WATER_FIXED_ORDER 1 // stable draw order for water, draws water surfs using texture chains even in indirect mode
-
-void	   R_TimeRefresh_f (void);
-void	   R_ReadPointFile_f (void);
-texture_t *R_TextureAnimation (texture_t *base, int frame);
+void		   R_TimeRefresh_f (void);
+void		   R_ReadPointFile_f (void);
+texture_t	  *R_TextureAnimation (texture_t *base, int frame);
+extern vec3_t *r_pointfile;
 
 typedef enum
 {
@@ -108,6 +107,12 @@ typedef struct particle_s
 #ifdef PSET_SCRIPT
 void PScript_InitParticles (void);
 void PScript_Shutdown (void);
+void PScript_FlushDlightsTask (void *unused);				// serial: dlights queued by last frame's deferred effect spawns; must
+															// run before anything reads cl_dlights and before the next layout
+void PScript_UpdateParticlesSetupTask (void *unused);		// serial: frame time step, rain spawns, kill + flatten live particles
+void PScript_UpdateParticlesTask (int index, void *unused); // indexed over the worker count: the parallel particle update
+void PScript_LayoutParticlesTask (void *unused);			// serial: batch creation and vertex range reservation, beams, decals
+void PScript_EmitParticlesTask (int index, void *unused);	// indexed over the worker count: parallel vertex generation
 void PScript_DrawParticles (cb_context_t *blend_cbx, cb_context_t *wboit_cbx);
 void PScript_DrawParticles_ShowTris (cb_context_t *cbx);
 struct trailstate_s;
@@ -147,6 +152,7 @@ typedef struct vulkan_pipeline_layout_s
 {
 	VkPipelineLayout	handle;
 	VkPushConstantRange push_constant_range;
+	int					mboit_input_attachment_set;
 } vulkan_pipeline_layout_t;
 
 typedef struct vulkan_pipeline_s
@@ -158,6 +164,7 @@ typedef struct vulkan_pipeline_s
 typedef struct vulkan_desc_set_layout_s
 {
 	VkDescriptorSetLayout handle;
+	int					  num_samplers;
 	int					  num_combined_image_samplers;
 	int					  num_ubos;
 	int					  num_ubos_dynamic;
@@ -182,12 +189,17 @@ typedef struct vulkan_memory_s
 	vulkan_memory_type_t type;
 } vulkan_memory_t;
 
-#define WORLD_PIPELINE_COUNT		16
-#define MODEL_PIPELINE_COUNT		6
-#define FTE_PARTICLE_PIPELINE_COUNT 16
-#define MAX_BATCH_SIZE				65536
-#define NUM_WORLD_CBX				6
-#define NUM_ENTITIES_CBX			6
+#define WORLD_PIPELINE_COUNT			   16
+// slot layout of the alias/md5 pipeline arrays: 0..3 encode alpha test/blend, 4..5 are the r_showtris variants
+#define MODEL_PIPELINE_ALPHA_TEST_BIT	   1
+#define MODEL_PIPELINE_ALPHA_BLEND_BIT	   2
+#define MODEL_PIPELINE_SHOWTRIS			   4
+#define MODEL_PIPELINE_SHOWTRIS_DEPTH_TEST 5
+#define MODEL_PIPELINE_COUNT			   6
+#define FTE_PARTICLE_PIPELINE_COUNT		   16
+#define MAX_BATCH_SIZE					   65536
+#define NUM_WORLD_CBX					   6
+#define NUM_ENTITIES_CBX				   6
 
 typedef enum
 {
@@ -210,7 +222,11 @@ typedef enum
 	SCBX_WATER,
 	SCBX_ALPHA_ENTITIES,
 	SCBX_PARTICLES,
-	SCBX_WBOIT_RESOLVE,
+	SCBX_MBOIT_COMPOSITE_ALPHA_ENTITIES_ACROSS_WATER,
+	SCBX_MBOIT_COMPOSITE_WATER,
+	SCBX_MBOIT_COMPOSITE_ALPHA_ENTITIES,
+	SCBX_MBOIT_COMPOSITE_PARTICLES,
+	SCBX_OIT_RESOLVE,
 	// UI render Pass:
 	SCBX_GUI,
 	SCBX_POST_PROCESS,
@@ -218,6 +234,8 @@ typedef enum
 	// Last pass before UI
 	SCBX_MAIN_OPAQUE_PASS_LAST = SCBX_FTE_PARTICLES_BLEND,
 	SCBX_MAIN_PASS_LAST = SCBX_PARTICLES,
+	SCBX_MBOIT_COMPOSITE_PASS_FIRST = SCBX_MBOIT_COMPOSITE_ALPHA_ENTITIES_ACROSS_WATER,
+	SCBX_MBOIT_COMPOSITE_PASS_LAST = SCBX_MBOIT_COMPOSITE_PARTICLES,
 } secondary_cb_contexts_t;
 
 typedef enum
@@ -225,7 +243,10 @@ typedef enum
 	RENDER_PASS_INDEX_MAIN,
 	RENDER_PASS_INDEX_UI,
 	RENDER_PASS_INDEX_MAIN_OIT,
+	RENDER_PASS_INDEX_MAIN_MBOIT,
 	RENDER_PASS_INDEX_WBOIT,
+	RENDER_PASS_INDEX_MBOIT_MOMENTS,
+	RENDER_PASS_INDEX_MBOIT_COMPOSITE,
 	RENDER_PASS_INDEX_COUNT,
 } render_pass_index_t;
 
@@ -233,6 +254,7 @@ typedef enum
 {
 	MAIN_RENDER_PASS_STANDARD,
 	MAIN_RENDER_PASS_OIT,
+	MAIN_RENDER_PASS_MBOIT,
 	MAIN_RENDER_PASS_VARIANT_COUNT,
 } main_render_pass_variant_t;
 
@@ -243,9 +265,56 @@ typedef enum
 	MAIN_RENDER_PASS_STENCIL_COUNT,
 } main_render_pass_stencil_t;
 
+typedef enum
+{
+	OIT_MODE_NONE,
+	OIT_MODE_WBOIT,
+	OIT_MODE_MBOIT,
+} oit_mode_t;
+
+extern oit_mode_t frame_oit_mode;
+
+static inline qboolean R_UseOIT (void)
+{
+	return frame_oit_mode != OIT_MODE_NONE;
+}
+
+static inline qboolean R_UseWBOIT (void)
+{
+	return frame_oit_mode == OIT_MODE_WBOIT;
+}
+
+static inline qboolean R_UseMBOIT (void)
+{
+	return frame_oit_mode == OIT_MODE_MBOIT;
+}
+
 static inline main_render_pass_variant_t R_MainPassPipelineVariant (int render_pass_index)
 {
-	return (render_pass_index == RENDER_PASS_INDEX_MAIN_OIT) ? MAIN_RENDER_PASS_OIT : MAIN_RENDER_PASS_STANDARD;
+	if (render_pass_index == RENDER_PASS_INDEX_MAIN_OIT)
+		return MAIN_RENDER_PASS_OIT;
+	if (render_pass_index == RENDER_PASS_INDEX_MAIN_MBOIT)
+		return MAIN_RENDER_PASS_MBOIT;
+	return MAIN_RENDER_PASS_STANDARD;
+}
+
+// selects between the standard, WBOIT accumulation, MBOIT moment and MBOIT composite
+// pipelines of a shader family based on the render pass a context records into
+static inline vulkan_pipeline_t R_PipelineForRenderPass (
+	int render_pass_index, vulkan_pipeline_t main_pipeline, vulkan_pipeline_t wboit_pipeline, vulkan_pipeline_t mboit_moment_pipeline,
+	vulkan_pipeline_t mboit_composite_pipeline)
+{
+	switch (render_pass_index)
+	{
+	case RENDER_PASS_INDEX_WBOIT:
+		return wboit_pipeline;
+	case RENDER_PASS_INDEX_MBOIT_MOMENTS:
+		return mboit_moment_pipeline;
+	case RENDER_PASS_INDEX_MBOIT_COMPOSITE:
+		return mboit_composite_pipeline;
+	default:
+		return main_pipeline;
+	}
 }
 
 static const int SECONDARY_CB_MULTIPLICITY[SCBX_NUM] = {
@@ -258,7 +327,11 @@ static const int SECONDARY_CB_MULTIPLICITY[SCBX_NUM] = {
 	1,				  // SCBX_WATER,
 	1,				  // SCBX_ALPHA_ENTITIES,
 	1,				  // SCBX_PARTICLES,
-	1,				  // SCBX_WBOIT_RESOLVE,
+	1,				  // SCBX_MBOIT_COMPOSITE_ALPHA_ENTITIES_ACROSS_WATER,
+	1,				  // SCBX_MBOIT_COMPOSITE_WATER,
+	1,				  // SCBX_MBOIT_COMPOSITE_ALPHA_ENTITIES,
+	1,				  // SCBX_MBOIT_COMPOSITE_PARTICLES,
+	1,				  // SCBX_OIT_RESOLVE,
 	1,				  // SCBX_GUI,
 	1,				  // SCBX_POST_PROCESS,
 };
@@ -282,6 +355,7 @@ typedef struct
 	qboolean						 validation;
 	qboolean						 debug_utils;
 	VkQueue							 queue;
+	SDL_Mutex						*queue_mutex;
 	cb_context_t					 primary_cb_contexts[PCBX_NUM];
 	cb_context_t					*secondary_cb_contexts[SCBX_NUM];
 	VkClearValue					 color_clear_value;
@@ -310,11 +384,15 @@ typedef struct
 	qboolean dedicated_allocation;
 	qboolean full_screen_exclusive;
 	qboolean ray_query;
+	qboolean present_wait;
 
 	// Buffers
 	VkImage color_buffers[NUM_COLOR_BUFFERS];
 	VkImage oit_accum_buffer;
 	VkImage oit_reveal_buffer;
+	VkImage mboit_b0_buffer;
+	VkImage mboit_moments0_buffer;
+	VkImage mboit_color_buffer;
 
 	// Index buffers
 	VkBuffer fan_index_buffer;
@@ -329,16 +407,28 @@ typedef struct
 	// Pipelines
 	vulkan_pipeline_t		 basic_alphatest_pipeline[RENDER_PASS_INDEX_COUNT];
 	vulkan_pipeline_t		 basic_blend_pipeline[RENDER_PASS_INDEX_COUNT];
+	vulkan_pipeline_t		 gui_pipeline[RENDER_PASS_INDEX_COUNT];
+	vulkan_pipeline_t		 gui_blend_pipeline[RENDER_PASS_INDEX_COUNT];
 	vulkan_pipeline_t		 basic_notex_blend_pipeline[RENDER_PASS_INDEX_COUNT];
+	vulkan_pipeline_t		 menu_xbr_pipeline[RENDER_PASS_INDEX_COUNT];
+	vulkan_pipeline_t		 menu_xbr_blend_pipeline[RENDER_PASS_INDEX_COUNT];
 	vulkan_pipeline_layout_t basic_pipeline_layout;
+	vulkan_pipeline_layout_t gui_pipeline_layout;
 	vulkan_pipeline_t		 world_pipelines[MAIN_RENDER_PASS_VARIANT_COUNT][WORLD_PIPELINE_COUNT];
 	vulkan_pipeline_t		 world_wboit_pipelines[WORLD_PIPELINE_COUNT];
+	vulkan_pipeline_t		 world_mboit_moment_pipelines[WORLD_PIPELINE_COUNT];
+	vulkan_pipeline_t		 world_mboit_composite_pipelines[WORLD_PIPELINE_COUNT];
 	vulkan_pipeline_layout_t world_pipeline_layout;
 	vulkan_pipeline_t		 raster_tex_warp_pipeline;
 	vulkan_pipeline_t		 particle_pipeline;
 	vulkan_pipeline_t		 particle_oit_pipeline;
+	vulkan_pipeline_t		 particle_post_oit_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT];
+	vulkan_pipeline_t		 particle_mboit_moment_pipeline;
+	vulkan_pipeline_t		 particle_mboit_composite_pipeline;
 	vulkan_pipeline_t		 sprite_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT];
 	vulkan_pipeline_t		 sprite_oit_pipeline;
+	vulkan_pipeline_t		 sprite_mboit_moment_pipeline;
+	vulkan_pipeline_t		 sprite_mboit_composite_pipeline;
 	vulkan_pipeline_layout_t sky_pipeline_layout[2]; // one texture (cubemap-like), two textures (animated layers)
 	vulkan_pipeline_t		 sky_stencil_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT][2];
 	vulkan_pipeline_t		 sky_color_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT][2];
@@ -347,10 +437,19 @@ typedef struct
 	vulkan_pipeline_t		 sky_layer_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT][2];
 	vulkan_pipeline_t		 alias_pipelines[MAIN_RENDER_PASS_VARIANT_COUNT][MODEL_PIPELINE_COUNT];
 	vulkan_pipeline_t		 alias_wboit_pipelines[MODEL_PIPELINE_COUNT];
+	vulkan_pipeline_t		 alias_mboit_moment_pipelines[MODEL_PIPELINE_COUNT];
+	vulkan_pipeline_t		 alias_mboit_composite_pipelines[MODEL_PIPELINE_COUNT];
 	vulkan_pipeline_t		 md5_pipelines[MAIN_RENDER_PASS_VARIANT_COUNT][MODEL_PIPELINE_COUNT];
 	vulkan_pipeline_t		 md5_wboit_pipelines[MODEL_PIPELINE_COUNT];
+	vulkan_pipeline_t		 md5_mboit_moment_pipelines[MODEL_PIPELINE_COUNT];
+	vulkan_pipeline_t		 md5_mboit_composite_pipelines[MODEL_PIPELINE_COUNT];
+	vulkan_pipeline_t		 md5_8_pipelines[MAIN_RENDER_PASS_VARIANT_COUNT][MODEL_PIPELINE_COUNT];
+	vulkan_pipeline_t		 md5_8_wboit_pipelines[MODEL_PIPELINE_COUNT];
+	vulkan_pipeline_t		 md5_8_mboit_moment_pipelines[MODEL_PIPELINE_COUNT];
+	vulkan_pipeline_t		 md5_8_mboit_composite_pipelines[MODEL_PIPELINE_COUNT];
 	vulkan_pipeline_t		 postprocess_pipeline;
 	vulkan_pipeline_t		 wboit_resolve_pipeline;
+	vulkan_pipeline_t		 mboit_resolve_pipeline;
 	vulkan_pipeline_t		 screen_effects_pipeline;
 	vulkan_pipeline_t		 screen_effects_scale_pipeline;
 	vulkan_pipeline_t		 screen_effects_scale_sops_pipeline;
@@ -359,7 +458,8 @@ typedef struct
 	vulkan_pipeline_t		 showtris_indirect_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT];
 	vulkan_pipeline_t		 showtris_depth_test_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT];
 	vulkan_pipeline_t		 showtris_indirect_depth_test_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT];
-	vulkan_pipeline_t		 showbboxes_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT];
+	vulkan_pipeline_t		 debug_lines_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT];
+	vulkan_pipeline_t		 md5_debug_pipeline[MAIN_RENDER_PASS_VARIANT_COUNT];
 	vulkan_pipeline_t		 update_lightmap_pipeline;
 	vulkan_pipeline_t		 update_lightmap_rt_pipeline;
 	vulkan_pipeline_t		 indirect_draw_pipeline;
@@ -367,23 +467,31 @@ typedef struct
 	vulkan_pipeline_t		 ray_debug_pipeline;
 	vulkan_pipeline_t		 mesh_interpolate_pipeline;
 	vulkan_pipeline_t		 skinning_pipeline;
+	vulkan_pipeline_t		 skinning_8_pipeline;
 #ifdef PSET_SCRIPT
 	vulkan_pipeline_t fte_particle_pipelines[MAIN_RENDER_PASS_VARIANT_COUNT][FTE_PARTICLE_PIPELINE_COUNT];
 	vulkan_pipeline_t fte_particle_wboit_pipelines[FTE_PARTICLE_PIPELINE_COUNT];
+	vulkan_pipeline_t fte_particle_post_oit_pipelines[MAIN_RENDER_PASS_VARIANT_COUNT][FTE_PARTICLE_PIPELINE_COUNT];
 #endif
 
 	// Descriptors
 	VkDescriptorPool		 descriptor_pool;
 	vulkan_desc_set_layout_t ubo_set_layout;
 	vulkan_desc_set_layout_t single_texture_set_layout;
+	vulkan_desc_set_layout_t gui_sampler_set_layout;
+	VkDescriptorSet			 gui_sampler_descriptor_sets[2];
 	vulkan_desc_set_layout_t input_attachment_set_layout;
 	vulkan_desc_set_layout_t oit_input_attachment_set_layout;
+	vulkan_desc_set_layout_t mboit_input_attachment_set_layout;
+	VkDescriptorSet			 mboit_input_attachment_descriptor_set;
 	VkDescriptorSet			 screen_effects_desc_set;
 	vulkan_desc_set_layout_t screen_effects_set_layout;
 	vulkan_desc_set_layout_t single_texture_cs_write_set_layout;
 	vulkan_desc_set_layout_t lightmap_compute_set_layout;
 	VkDescriptorSet			 indirect_compute_desc_set;
 	vulkan_desc_set_layout_t indirect_compute_set_layout;
+	VkDescriptorSet			 bmodel_instances_desc_set;
+	vulkan_desc_set_layout_t bmodel_instances_set_layout;
 	vulkan_desc_set_layout_t ray_query_push_set_layout;
 	VkDescriptorSet			 ray_debug_desc_set;
 	vulkan_desc_set_layout_t ray_debug_set_layout;
@@ -392,6 +500,8 @@ typedef struct
 	// Samplers
 	VkSampler point_sampler;
 	VkSampler linear_sampler;
+	VkSampler gui_point_sampler;
+	VkSampler gui_linear_sampler;
 	VkSampler point_aniso_sampler;
 	VkSampler linear_aniso_sampler;
 	VkSampler point_sampler_lod_bias;
@@ -463,7 +573,7 @@ extern int		d_lightstylevalue[MAX_LIGHTSTYLES]; // 8.8 fraction of base light va
 extern cvar_t r_drawentities;
 extern cvar_t r_drawworld;
 extern cvar_t r_drawviewmodel;
-extern cvar_t r_speeds;
+extern cvar_t scr_speeds;
 extern cvar_t r_pos;
 extern cvar_t r_waterwarp;
 extern cvar_t r_fullbright;
@@ -487,6 +597,13 @@ extern cvar_t gl_nocolors;
 // johnfitz -- rendering statistics
 extern atomic_uint32_t rs_brushpolys, rs_aliaspolys, rs_skypolys, rs_particles, rs_fogpolys;
 extern atomic_uint32_t rs_dynamiclightmaps, rs_brushpasses, rs_aliaspasses;
+// scr_speeds frame times: all accesses are ordered by the task graph (draw_done -> end_rendering -> begin_rendering -> draw_done)
+extern uint32_t		   rs_cputime_us, rs_gputime_us;
+extern uint32_t		   rs_gpuwaittime_us; // time the CPU spent blocked on the GPU during the last completed frame
+extern uint32_t		   rs_gpuwaitaccum_us;
+extern double		   rs_frame_starttime;
+extern char			   rs_display_lines[3][40]; // scr_speeds on screen overlay, updated from the counters once per frame
+extern int			   rs_display_numlines;
 
 extern atomic_uint64_t total_device_vulkan_allocation_size;
 extern atomic_uint64_t total_host_vulkan_allocation_size;
@@ -523,6 +640,14 @@ typedef struct
 	byte  color[4];
 } basicvertex_t;
 
+typedef struct
+{
+	float position[3];
+	float texcoord[2];
+	byte  color[4];
+	float texture_region[4];
+} draw_pic_vertex_t;
+
 // johnfitz -- moved here from r_brush.c
 extern int gl_lightmap_format;
 
@@ -535,12 +660,16 @@ extern int gl_lightmap_format;
 #define LM_CULL_BLOCK_W 128
 #define LM_CULL_BLOCK_H 256
 
+#define LM_WORKGROUP_SUBMODEL_EMPTY 0xFFFFFFFE // no surfaces assigned yet, converted to 0 before upload
+#define LM_WORKGROUP_SUBMODEL_MIXED 0xFFFFFFFF // surfaces from multiple coordinate spaces, the shader can't cull and passes all lights
+
 typedef struct lm_compute_workgroup_bounds_s
 {
-	float mins[3];
-	float maxs[3];
+	float	 mins[3];
+	float	 maxs[3];
+	uint32_t submodel; // submodel the surfaces in this workgroup belong to (bounds are in its model space), or LM_WORKGROUP_SUBMODEL_*
 } lm_compute_workgroup_bounds_t;
-COMPILE_TIME_ASSERT (lm_compute_workgroup_bounds_t, sizeof (lm_compute_workgroup_bounds_t) == 24);
+COMPILE_TIME_ASSERT (lm_compute_workgroup_bounds_t, sizeof (lm_compute_workgroup_bounds_t) == 28);
 
 typedef struct glRect_s
 {
@@ -564,6 +693,7 @@ struct lightmap_s
 
 	lm_compute_workgroup_bounds_t global_bounds[LMBLOCK_HEIGHT / LM_CULL_BLOCK_H][LMBLOCK_WIDTH / LM_CULL_BLOCK_W];
 	byte						  active_dlights[LMBLOCK_HEIGHT / LM_CULL_BLOCK_H][LMBLOCK_WIDTH / LM_CULL_BLOCK_W];
+	byte						  block_has_submodels[LMBLOCK_HEIGHT / LM_CULL_BLOCK_H][LMBLOCK_WIDTH / LM_CULL_BLOCK_W];
 	byte						  num_used_lightstyles[LMBLOCK_HEIGHT / LM_CULL_BLOCK_H][LMBLOCK_WIDTH / LM_CULL_BLOCK_W];
 	byte						  used_lightstyles[LMBLOCK_HEIGHT / LM_CULL_BLOCK_H][LMBLOCK_WIDTH / LM_CULL_BLOCK_W][MAX_LIGHTSTYLES];
 	int							  cached_light[MAX_LIGHTSTYLES];
@@ -584,9 +714,8 @@ extern qboolean r_fullbright_cheatsafe, r_lightmap_cheatsafe, r_drawworld_cheats
 extern float map_wateralpha, map_lavaalpha, map_telealpha, map_slimealpha; // ericw
 extern float map_fallbackalpha; // spike -- because we might want r_wateralpha to apply to teleporters while water itself wasn't watervised
 
-extern qboolean oit_active;
-qboolean		R_UseAlphaSort (void);
-qboolean		R_UseIndirectTransparentWater (void);
+qboolean R_UseAlphaSort (void);
+qboolean R_UseIndirectTransparentWater (void);
 
 extern task_handle_t prev_end_rendering_task;
 
@@ -610,11 +739,14 @@ void R_BuildTopLevelAccelerationStructure (void *unused);
 void R_UpdateAnimatedBLASes (cb_context_t *cbx);
 void R_UpdateLightmapsAndIndirect (void *unused);
 void R_MarkSurfaces (qboolean use_tasks, task_handle_t before_mark, task_handle_t *store_efrags, task_handle_t *cull_surfaces, task_handle_t *chain_surfaces);
-qboolean R_CullBox (vec3_t emins, vec3_t emaxs);
-void	 R_StoreEfrags (efrag_t **ppefrag);
-qboolean R_CullModelForEntity (entity_t *e);
-void	 R_RotateForEntity (float matrix[16], vec3_t origin, vec3_t angles, unsigned char scale);
-void	 R_MarkLights (dlight_t *light, int num, mnode_t *node);
+qboolean	  R_CullBox (vec3_t emins, vec3_t emaxs);
+void		  R_StoreEfrags (efrag_t **ppefrag);
+qboolean	  R_CullModelForEntity (entity_t *e);
+void		  R_RotateForEntity (float matrix[16], vec3_t origin, vec3_t angles, unsigned char scale);
+void		  R_MarkLights (dlight_t *light, int num, mnode_t *node);
+extern vec3_t lightmap_dlight_origins[MAX_DLIGHTS]; // dlight origins in the space of the model currently having its lightmaps built (CPU lightmap update path)
+void		  R_ParseEntityDlights (void);			// 2021 rerelease "dynamiclight" entities, parsed from the entity lump at map load
+void		  R_UpdateEntityDlights (void);			// keeps the parsed entity dlights alive, called every frame
 
 void R_InitParticles (void);
 void R_DrawParticles (cb_context_t *cbx);
@@ -628,6 +760,7 @@ void R_UpdateWarpTextures (void *unused);
 void R_MarkDeps (int combined_deps, int worker_index);
 
 qboolean R_IndirectBrush (entity_t *e);
+void	 R_ClearBModelInstanceClaims (void);
 
 void R_DrawWorld (cb_context_t *cbx, int index);
 
@@ -642,10 +775,8 @@ typedef struct
 } lerpdata_t;
 // johnfitz
 
-void R_UpdateEntityAnimState (entity_t *e, aliashdr_t *paliashdr);
-void R_UpdateEntityMoveState (entity_t *e);
-void R_GetEntityLerpedTransform (entity_t *e, vec3_t out_origin, vec3_t out_angles);
-void R_SetupAliasFrame (entity_t *e, aliashdr_t *paliashdr, int frame, lerpdata_t *lerpdata);
+void R_GetEntityLerpedTransform (const entity_t *e, vec3_t out_origin, vec3_t out_angles);
+void R_SetupAliasFrame (const entity_t *e, aliashdr_t *paliashdr, lerpdata_t *lerpdata);
 void R_DrawAliasModel (cb_context_t *cbx, entity_t *e, int *aliaspolys);
 void R_DrawBrushModel (cb_context_t *cbx, entity_t *e, int chain, int *brushpolys, qboolean sort, qboolean water_opaque_only, qboolean water_transparent_only);
 void R_DrawSpriteModel (cb_context_t *cbx, entity_t *e);
@@ -663,7 +794,9 @@ void GL_DeleteBModelAccelerationStructures (void);
 void GL_BuildBModelVertexBuffer (void);
 void GL_BuildBModelAccelerationStructures (void);
 void GL_PrepareSIMDAndParallelData (void);
-void GLMesh_UploadBuffers (qmodel_t *mod, aliashdr_t *hdr, unsigned short *indexes, byte *vertexes, aliasmesh_t *desc, jointpose_t *joints);
+void GLMesh_UploadBuffers (
+	qmodel_t *mod, aliashdr_t *hdr, unsigned short *indexes, byte *vertexes, aliasmesh_t *desc, jointpose_t *joints, unsigned short *skeleton_indexes,
+	int num_skeleton_indexes);
 void GLMesh_DeleteAllMeshBuffers (void);
 void R_AllocateEntityBLAS (entity_t *e);
 void R_FreeEntityBLAS (entity_t *e);
@@ -684,6 +817,7 @@ void R_UploadLightmaps (void);
 void R_DrawWorld_ShowTris (cb_context_t *cbx);
 void R_DrawBrushModel_ShowTris (cb_context_t *cbx, entity_t *e);
 void R_DrawAliasModel_ShowTris (cb_context_t *cbx, entity_t *e);
+void R_DrawAliasModel_ShowSkel (cb_context_t *cbx, entity_t *e);
 void R_DrawParticles_ShowTris (cb_context_t *cbx);
 void R_DrawSpriteModel_ShowTris (cb_context_t *cbx, entity_t *e);
 
@@ -744,6 +878,12 @@ static inline void R_BindPipeline (cb_context_t *cbx, VkPipelineBindPoint bind_p
 			vulkan_globals.vk_cmd_push_constants (
 				cbx->cb, pipeline.layout.handle, pipeline.layout.push_constant_range.stageFlags, 0, pipeline.layout.push_constant_range.size, zeroes);
 		cbx->current_pipeline = pipeline;
+		if (cbx->render_pass_index == RENDER_PASS_INDEX_MBOIT_COMPOSITE && pipeline.layout.mboit_input_attachment_set >= 0)
+		{
+			vulkan_globals.vk_cmd_bind_descriptor_sets (
+				cbx->cb, bind_point, pipeline.layout.handle, pipeline.layout.mboit_input_attachment_set, 1,
+				&vulkan_globals.mboit_input_attachment_descriptor_set, 0, NULL);
+		}
 	}
 }
 
