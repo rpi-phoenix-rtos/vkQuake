@@ -34,6 +34,14 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
  * duplicating a handle retains, closing one releases, and the last release frees.
  * Without this, the second close of any pak-backed handle is a double free (and the
  * reads after it a use-after-free) -- which is exactly what a 2026-09-04 run showed.
+ *
+ * The count is ATOMIC because the duplication is concurrent by design: the comment
+ * at COM_FindFile says "we can have concurrent reads to the pack", and vkQuake's
+ * loader runs those from its task workers. With a plain ++/-- two retains can both
+ * read 1 and store 2, leaving a count one short of the handles holding it -- and
+ * then a live pak handle reading freed memory. That is a timing race no torch bench
+ * would ever show, in a port whose history is intermittent corruption misattributed
+ * for weeks.
  */
 #define SLURP_HDR sizeof (size_t)
 
@@ -45,7 +53,7 @@ static size_t *slurp_refs (const byte *memory)
 static void slurp_retain (const byte *memory)
 {
 	if (memory)
-		(*slurp_refs (memory))++;
+		__atomic_add_fetch (slurp_refs (memory), 1, __ATOMIC_ACQ_REL);
 }
 
 static void slurp_release (const byte *memory)
@@ -56,7 +64,7 @@ static void slurp_release (const byte *memory)
 		return;
 
 	refs = slurp_refs (memory);
-	if (--(*refs) == 0)
+	if (__atomic_sub_fetch (refs, 1, __ATOMIC_ACQ_REL) == 0)
 		free (refs);
 }
 
@@ -173,7 +181,7 @@ qfilesize_t Sys_FileOpenRead (const char *path, int *hndl)
 		*hndl = -1;
 		return -1;
 	}
-	*(size_t *)raw = 1; /* one reference: this handle */
+	__atomic_store_n ((size_t *)raw, (size_t)1, __ATOMIC_RELAXED); /* one reference: this handle */
 	buf = (byte *)raw + SLURP_HDR;
 	if (len > 0 && fread (buf, 1, (size_t) len, f) != (size_t) len)
 	{
