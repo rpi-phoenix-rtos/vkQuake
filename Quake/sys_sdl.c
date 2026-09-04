@@ -26,6 +26,40 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
 
 #include <errno.h>
 
+/*
+ * Phoenix: the slurping Sys_FileOpenRead below hands the handle a malloc'd buffer
+ * (see the comment there), and upstream's COM_FindFile duplicates a pak's handle on
+ * EVERY file it opens out of that pak, so one buffer is reachable from many handles.
+ * Reference-count it in a header word just below the pointer the handle carries:
+ * duplicating a handle retains, closing one releases, and the last release frees.
+ * Without this, the second close of any pak-backed handle is a double free (and the
+ * reads after it a use-after-free) -- which is exactly what a 2026-09-04 run showed.
+ */
+#define SLURP_HDR sizeof (size_t)
+
+static size_t *slurp_refs (const byte *memory)
+{
+	return (size_t *)(void *)((char *)(void *)(uintptr_t)memory - SLURP_HDR);
+}
+
+static void slurp_retain (const byte *memory)
+{
+	if (memory)
+		(*slurp_refs (memory))++;
+}
+
+static void slurp_release (const byte *memory)
+{
+	size_t *refs;
+
+	if (!memory)
+		return;
+
+	refs = slurp_refs (memory);
+	if (--(*refs) == 0)
+		free (refs);
+}
+
 typedef struct file_handle_s
 {
 	bool		free;
@@ -107,6 +141,7 @@ qfilesize_t Sys_FileOpenRead (const char *path, int *hndl)
 	int			i;
 	long		len;
 	byte	   *buf;
+	void	   *raw;
 
 	i = allocHandle ();
 	f = Sys_fopen (path, "rb");
@@ -131,16 +166,18 @@ qfilesize_t Sys_FileOpenRead (const char *path, int *hndl)
 	fseek (f, 0, SEEK_SET);
 	if (len < 0)
 		len = 0;
-	buf = (byte *) malloc ((size_t) (len > 0 ? len : 1)); /* >=1 byte so memory[]!=NULL marks the handle used */
-	if (!buf)
+	raw = malloc (SLURP_HDR + (size_t) (len > 0 ? len : 1)); /* >=1 byte so memory[]!=NULL marks the handle used */
+	if (!raw)
 	{
 		fclose (f);
 		*hndl = -1;
 		return -1;
 	}
+	*(size_t *)raw = 1; /* one reference: this handle */
+	buf = (byte *)raw + SLURP_HDR;
 	if (len > 0 && fread (buf, 1, (size_t) len, f) != (size_t) len)
 	{
-		free (buf);
+		free (raw);
 		fclose (f);
 		*hndl = -1;
 		return -1;
@@ -186,6 +223,11 @@ int Sys_DuplicateHandle (int handle)
 
 	// duplicate all data
 	sys_handles[new_handle] = sys_handles[handle];
+
+	/* Phoenix: the copy carries the same owned buffer -- retain it so the first
+	 * close does not pull it out from under the other handle. */
+	if (sys_handles[handle].owns_memory)
+		slurp_retain (sys_handles[handle].memory);
 
 	// replace with the new file
 	if (sys_handles[handle].file)
@@ -245,7 +287,7 @@ void Sys_FileClose (int handle)
 	}
 	else if (sys_handles[handle].owns_memory && sys_handles[handle].memory)
 	{
-		free ((void *) sys_handles[handle].memory); /* slurped read buffer (NOT the static embedded pak) */
+		slurp_release (sys_handles[handle].memory); /* slurped read buffer (NOT the static embedded pak) */
 	}
 	sys_handles[handle].memory = NULL;
 	sys_handles[handle].owns_memory = 0;
